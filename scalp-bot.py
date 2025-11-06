@@ -51,7 +51,7 @@ ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP_MULTIPLIER = 3.0
 ATR_PULLBACK_MULT = 0.5      # required pullback depth relative to ATR
-ATR_BREAK_EVEN_TRIGGER = 1.5 # move SL to break-even when price moves this ATR in favor
+ATR_BREAK_EVEN_TRIGGER = 1. # move SL to break-even when price moves this ATR in favor
 
 # Strategy / runtime
 EMA_FAST = 9
@@ -233,20 +233,19 @@ def place_trade(symbol, signal, sl, tp, lot=LOT, deviation=20, magic=MAGIC):
 
 def check_and_move_breakeven(symbol, magic=MAGIC, atr_trigger=ATR_BREAK_EVEN_TRIGGER):
     """
-    Check open positions for symbol and move SL to break-even when price moves atr_trigger * ATR in favor.
-    This function attempts to modify the position's SL using mt5.order_modify. Many brokers allow position modification via
-    order_modify on the position ticket; if not supported you will see an error in logs and must adapt to your broker's API.
+    بررسی پوزیشن‌های باز و انتقال حدضرر به نقطه ورود (Break-Even)
+    وقتی قیمت حداقل atr_trigger * ATR در جهت موفقیت حرکت کرده باشد.
+    از متد رسمی TRADE_ACTION_SLTP برای متاتریدر۵ استفاده می‌کند.
     """
     positions = get_open_positions(symbol, magic)
     if not positions:
         return
 
-    # get latest OHLC to compute ATR
+    # گرفتن آخرین داده برای محاسبه ATR
     df = fetch_ohlc(symbol, TIMEFRAME, n=100)
-    if df is None or 'atr' not in df.columns:
-        # compute atr
-        df = df.copy()
-        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_PERIOD).average_true_range()
+    if df is None:
+        return
+    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_PERIOD).average_true_range()
     atr = df['atr'].iat[-1]
 
     tick = mt5.symbol_info_tick(symbol)
@@ -255,43 +254,48 @@ def check_and_move_breakeven(symbol, magic=MAGIC, atr_trigger=ATR_BREAK_EVEN_TRI
 
     for pos in positions:
         try:
-            pos_ticket = int(getattr(pos, 'ticket', getattr(pos, 'ticket', -1)))
+            ticket = int(getattr(pos, "ticket", -1))
             pos_type = int(pos.type)
-            entry = float(pos.price_open)
-            current_price = float(tick.bid) if pos_type == mt5.ORDER_TYPE_BUY else float(tick.ask)
+            price_open = float(pos.price_open)
+            tp = float(pos.tp)
+            sl = float(pos.sl)
 
-            # check move amount
             if pos_type == mt5.ORDER_TYPE_BUY:
-                moved = current_price - entry
-                trigger_amount = atr_trigger * atr
-                if moved >= trigger_amount:
-                    # move SL to entry (break-even)
-                    new_sl = entry
-                    try:
-                        # best-effort: many brokers accept order_modify for positions
-                        ok = mt5.order_modify(pos_ticket, pos.price_open, new_sl, pos.tp)
-                        if ok:
-                            logging.info(f"Moved BUY SL to break-even for ticket {pos_ticket}")
-                        else:
-                            logging.warning(f"order_modify returned False for ticket {pos_ticket}: {mt5.last_error()}")
-                    except Exception as e:
-                        logging.exception(f"Failed to modify SL for ticket {pos_ticket}: {e}")
-            else:
-                moved = entry - current_price
-                trigger_amount = atr_trigger * atr
-                if moved >= trigger_amount:
-                    new_sl = entry
-                    try:
-                        ok = mt5.order_modify(pos_ticket, pos.price_open, new_sl, pos.tp)
-                        if ok:
-                            logging.info(f"Moved SELL SL to break-even for ticket {pos_ticket}")
-                        else:
-                            logging.warning(f"order_modify returned False for ticket {pos_ticket}: {mt5.last_error()}")
-                    except Exception as e:
-                        logging.exception(f"Failed to modify SL for ticket {pos_ticket}: {e}")
-        except Exception as e:
-            logging.exception(f"Error checking position for break-even: {e}")
+                current_price = float(tick.bid)
+                profit_move = current_price - price_open
+            else:  # SELL
+                current_price = float(tick.ask)
+                profit_move = price_open - current_price
 
+            trigger_distance = atr_trigger * atr
+
+            # بررسی اگر قیمت به اندازه کافی در جهت معامله حرکت کرده
+            if profit_move >= trigger_distance and (
+                sl < price_open if pos_type == mt5.ORDER_TYPE_BUY else sl > price_open
+            ):
+                new_sl = price_open
+
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "symbol": symbol,
+                    "position": ticket,
+                    "sl": float(new_sl),
+                    "tp": float(tp),
+                }
+
+                result = mt5.order_send(request)
+                if result is None:
+                    logging.error(f"[BE] SLTP modify failed for ticket {ticket}: {mt5.last_error()}")
+                elif result.retcode != mt5.TRADE_RETCODE_DONE:
+                    logging.warning(
+                        f"[BE] Could not move SL to BE for ticket {ticket}. retcode={result.retcode}, comment={result.comment}"
+                    )
+                else:
+                    logging.info(f"[BE] SL moved to BE for ticket {ticket} ({'BUY' if pos_type==0 else 'SELL'})")
+        except Exception as e:
+            logging.exception(f"[BE] Error processing ticket {getattr(pos, 'ticket', '?')}: {e}")
+
+    
 # ------------------------
 # Main loop
 # ------------------------
