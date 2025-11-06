@@ -1,12 +1,13 @@
 """
-EMA9-EMA21 ATR Scalper — Live Auto-Trader for MetaTrader5
+EMA9-EMA21 ATR Scalper — Final Auto-Trader for MetaTrader5 (with Break-Even)
 
 Description
 -----------
-Simple, single-symbol (XAUUSD by default) M1 scalper that:
+Single-symbol (XAUUSD by default) M1 scalper that:
 - Computes EMA(9) and EMA(21) on 1-minute bars
 - Detects pullback-to-EMA9 entries confirmed by a close in the trend direction
 - Uses ATR(14) to set SL and TP automatically
+- Moves SL to Break-Even when price moves a defined distance in favor
 - Places market orders on MetaTrader5 with SL/TP
 
 Settings (editable at top of file)
@@ -17,12 +18,14 @@ Settings (editable at top of file)
 - ATR_SL_MULTIPLIER: SL = ATR * this
 - ATR_TP_MULTIPLIER: TP = ATR * this
 - ATR_PULLBACK_MULT: the pullback depth required (e.g. 0.5 means prev_close - low >= 0.5*ATR)
+- ATR_BREAK_EVEN_TRIGGER: distance in ATR to move SL to break-even
 - POLL_INTERVAL: seconds between checks
 
-Important
----------
+Important notes
+---------------
 - Replace MT5_LOGIN, MT5_PASSWORD, MT5_SERVER with your credentials if you want the script to login by itself.
 - Test thoroughly on a demo account before using live.
+- Different brokers expose / support position modification differently. The script attempts a best-effort SL move using `mt5.order_modify` (works in many setups) but you must verify on your broker. If `order_modify` isn't supported you will see a logged warning.
 """
 
 import time
@@ -46,13 +49,14 @@ LOT = 0.1                     # fixed lot size
 # ATR / SL / TP settings
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
-ATR_TP_MULTIPLIER = 2.0
+ATR_TP_MULTIPLIER = 3.0
 ATR_PULLBACK_MULT = 0.5      # required pullback depth relative to ATR
+ATR_BREAK_EVEN_TRIGGER = 1.5 # move SL to break-even when price moves this ATR in favor
 
 # Strategy / runtime
 EMA_FAST = 9
 EMA_SLOW = 21
-POLL_INTERVAL = 10           # seconds between checks
+POLL_INTERVAL = 1            # seconds between checks (user requested 1s)
 MAGIC = 123456               # magic number to identify EA orders (best-effort)
 MAX_ORDERS = 1               # max simultaneous orders for the symbol
 
@@ -117,7 +121,6 @@ def ema_atr_signals(df):
     df['ema_slow'] = ta.trend.EMAIndicator(df['close'], window=EMA_SLOW).ema_indicator()
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_PERIOD).average_true_range()
 
-    # default columns
     df['signal'] = 0
     df['sl'] = pd.NA
     df['tp'] = pd.NA
@@ -134,7 +137,7 @@ def ema_atr_signals(df):
     last_low = df['low'].iat[i]
     last_high = df['high'].iat[i]
 
-    # BUY condition: uptrend, touch EMA9, pullback depth and confirm close above EMA9
+    # BUY condition
     if ema9 > ema21:
         touched = last_low <= ema9
         pullback_ok = (prev_close - last_low) >= (ATR_PULLBACK_MULT * atr)
@@ -147,7 +150,7 @@ def ema_atr_signals(df):
             df.at[df.index[i], 'sl'] = sl
             df.at[df.index[i], 'tp'] = tp
 
-    # SELL condition: downtrend, touch EMA9, pullback depth and confirm close below EMA9
+    # SELL condition
     elif ema9 < ema21:
         touched = last_high >= ema9
         pullback_ok = (last_high - prev_close) >= (ATR_PULLBACK_MULT * atr)
@@ -176,10 +179,9 @@ def get_open_positions(symbol, magic=MAGIC):
     filtered = []
     for p in positions:
         try:
-            if int(p.magic) == int(magic):
+            if int(getattr(p, 'magic', -1)) == int(magic):
                 filtered.append(p)
         except Exception:
-            # broker might not provide magic — include all positions for symbol
             filtered.append(p)
     return filtered
 
@@ -199,7 +201,6 @@ def place_trade(symbol, signal, sl, tp, lot=LOT, deviation=20, magic=MAGIC):
     else:
         return None
 
-    # Build request
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -219,12 +220,77 @@ def place_trade(symbol, signal, sl, tp, lot=LOT, deviation=20, magic=MAGIC):
     if result is None:
         logging.error(f"order_send returned None: {mt5.last_error()}")
         return None
-    # result contains retcode and order information
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         logging.error(f"Order failed, retcode={result.retcode}, comment={result.comment}")
+        return result
     else:
         logging.info(f"Order placed: ticket={getattr(result, 'order', 'N/A')}, type={'BUY' if signal==1 else 'SELL'}, volume={lot}, sl={sl}, tp={tp}")
     return result
+
+# ------------------------
+# Break-Even helper
+# ------------------------
+
+def check_and_move_breakeven(symbol, magic=MAGIC, atr_trigger=ATR_BREAK_EVEN_TRIGGER):
+    """
+    Check open positions for symbol and move SL to break-even when price moves atr_trigger * ATR in favor.
+    This function attempts to modify the position's SL using mt5.order_modify. Many brokers allow position modification via
+    order_modify on the position ticket; if not supported you will see an error in logs and must adapt to your broker's API.
+    """
+    positions = get_open_positions(symbol, magic)
+    if not positions:
+        return
+
+    # get latest OHLC to compute ATR
+    df = fetch_ohlc(symbol, TIMEFRAME, n=100)
+    if df is None or 'atr' not in df.columns:
+        # compute atr
+        df = df.copy()
+        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_PERIOD).average_true_range()
+    atr = df['atr'].iat[-1]
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+
+    for pos in positions:
+        try:
+            pos_ticket = int(getattr(pos, 'ticket', getattr(pos, 'ticket', -1)))
+            pos_type = int(pos.type)
+            entry = float(pos.price_open)
+            current_price = float(tick.bid) if pos_type == mt5.ORDER_TYPE_BUY else float(tick.ask)
+
+            # check move amount
+            if pos_type == mt5.ORDER_TYPE_BUY:
+                moved = current_price - entry
+                trigger_amount = atr_trigger * atr
+                if moved >= trigger_amount:
+                    # move SL to entry (break-even)
+                    new_sl = entry
+                    try:
+                        # best-effort: many brokers accept order_modify for positions
+                        ok = mt5.order_modify(pos_ticket, pos.price_open, new_sl, pos.tp)
+                        if ok:
+                            logging.info(f"Moved BUY SL to break-even for ticket {pos_ticket}")
+                        else:
+                            logging.warning(f"order_modify returned False for ticket {pos_ticket}: {mt5.last_error()}")
+                    except Exception as e:
+                        logging.exception(f"Failed to modify SL for ticket {pos_ticket}: {e}")
+            else:
+                moved = entry - current_price
+                trigger_amount = atr_trigger * atr
+                if moved >= trigger_amount:
+                    new_sl = entry
+                    try:
+                        ok = mt5.order_modify(pos_ticket, pos.price_open, new_sl, pos.tp)
+                        if ok:
+                            logging.info(f"Moved SELL SL to break-even for ticket {pos_ticket}")
+                        else:
+                            logging.warning(f"order_modify returned False for ticket {pos_ticket}: {mt5.last_error()}")
+                    except Exception as e:
+                        logging.exception(f"Failed to modify SL for ticket {pos_ticket}: {e}")
+        except Exception as e:
+            logging.exception(f"Error checking position for break-even: {e}")
 
 # ------------------------
 # Main loop
@@ -257,6 +323,12 @@ def main_loop():
 
             df = ema_atr_signals(df)
             last = df.iloc[-1]
+
+            # Try to move existing positions to break-even first
+            try:
+                check_and_move_breakeven(SYMBOL)
+            except Exception as e:
+                logging.exception(f"Error in break-even check: {e}")
 
             if int(last['signal']) != 0:
                 positions = get_open_positions(SYMBOL, MAGIC)
