@@ -1,106 +1,72 @@
+
 """
-EMA9-EMA21 ATR Scalper — Final Auto-Trader for MetaTrader5 (with Break-Even)
-
-Description
------------
-Single-symbol (XAUUSD by default) M1 scalper that:
-- Computes EMA(9) and EMA(21) on 1-minute bars
-- Detects pullback-to-EMA9 entries confirmed by a close in the trend direction
-- Uses ATR(14) to set SL and TP automatically
-- Moves SL to Break-Even when price moves a defined distance in favor
-- Places market orders on MetaTrader5 with SL/TP
-
-Settings (editable at top of file)
-- SYMBOL: symbol to trade (default: "XAUUSD")
-- TIMEFRAME: timeframe constant from mt5 (default M1)
-- LOT: fixed lot size
-- ATR_PERIOD: ATR period (default 14)
-- ATR_SL_MULTIPLIER: SL = ATR * this
-- ATR_TP_MULTIPLIER: TP = ATR * this
-- ATR_PULLBACK_MULT: the pullback depth required (e.g. 0.5 means prev_close - low >= 0.5*ATR)
-- ATR_BREAK_EVEN_TRIGGER: distance in ATR to move SL to break-even
-- POLL_INTERVAL: seconds between checks
-
-Important notes
----------------
-- Replace MT5_LOGIN, MT5_PASSWORD, MT5_SERVER with your credentials if you want the script to login by itself.
-- Test thoroughly on a demo account before using live.
-- Different brokers expose / support position modification differently. The script attempts a best-effort SL move using `mt5.order_modify` (works in many setups) but you must verify on your broker. If `order_modify` isn't supported you will see a logged warning.
+EMA9-EMA21 Cross + Wait-for-Pullback Scalper with M5 Filter, BreakEven Option, and Dollar Risk Lot Sizing.
+--------------------------------------------------------------------
+Logic:
+  1. Detect EMA9/EMA21 cross (M1 or M2 timeframe).
+  2. Mark cross as pending (no immediate entry).
+  3. Wait until first candle touches EMA9 again and closes in cross direction → then enter.
+  4. Apply higher-timeframe (M5) EMA trend filter with adjustable parameters.
+  5. Manage position with ATR-based SL/TP, optional BreakEven, and risk-based lot sizing.
 """
 
 import time
 import logging
-
 import pandas as pd
-import ta
 import MetaTrader5 as mt5
+import ta
+import math
 
-# ------------------------
-# Configuration (EDIT THESE)
-# ------------------------
-MT5_LOGIN = 12345678          # replace with your account number (or leave as-is to try connecting to running MT5)
-MT5_PASSWORD = "your_pass"   # replace with your password
-MT5_SERVER = "YourBroker-Server"  # replace with your broker's server name
+# ---------------- CONFIG ----------------
 
-SYMBOL = "XAUUSD"            # symbol to trade (editable)
-TIMEFRAME = mt5.TIMEFRAME_M1  # 1-minute timeframe
-LOT = 0.1                     # fixed lot size
+MT5_LOGIN = 12345678
+MT5_PASSWORD = "your_pass"
+MT5_SERVER = "YourBroker-Server"
 
-# ATR / SL / TP settings
+SYMBOL = "XAUUSD"
+TIMEFRAME = mt5.TIMEFRAME_M1
+M5_TIMEFRAME = mt5.TIMEFRAME_M5
+
+ENABLE_M5_FILTER = False
+M5_EMA_FAST = 9
+M5_EMA_SLOW = 21
+
+ENABLE_BREAK_EVEN = True
+
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP_MULTIPLIER = 3.0
-ATR_PULLBACK_MULT = 0.5      # required pullback depth relative to ATR
-ATR_BREAK_EVEN_TRIGGER = 1. # move SL to break-even when price moves this ATR in favor
+ATR_BREAK_EVEN_TRIGGER = 1.0
 
-# Strategy / runtime
-EMA_FAST = 9
-EMA_SLOW = 21
-POLL_INTERVAL = 1            # seconds between checks (user requested 1s)
-MAGIC = 123456               # magic number to identify EA orders (best-effort)
-MAX_ORDERS = 1               # max simultaneous orders for the symbol
+EMA_FAST = 3
+EMA_SLOW = 5
 
-# Logging
+RISK_AMOUNT_USD = 20   # per trade risk
+
+POLL_INTERVAL = 1
+MAGIC = 123999
+MAX_ORDERS = 1
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-# ------------------------
-# MT5 connection helpers
-# ------------------------
+# ---------------- HELPERS ----------------
 
 def init_mt5():
-    # try to connect to a running MT5 terminal first
     if mt5.initialize():
-        logging.info("Connected to running MT5 instance (initialize()). Will attempt to use current terminal session.")
         try:
             _ = mt5.account_info()
-            logging.info("Account access OK (using running terminal session)")
             return True
         except Exception:
-            logging.warning("Running MT5 found but account access failed — will try login using provided credentials")
             mt5.shutdown()
-
-    # fallback: initialize then login
     if not mt5.initialize():
-        logging.error(f"mt5.initialize() failed, error = {mt5.last_error()}")
         return False
-    logged = mt5.login(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
-    if not logged:
-        logging.error(f"mt5.login() failed, error = {mt5.last_error()}")
-        return False
-    logging.info(f"Connected to MT5 via login — account: {MT5_LOGIN}")
-    return True
-
+    return mt5.login(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
 
 def shutdown_mt5():
     try:
         mt5.shutdown()
     except Exception:
         pass
-    logging.info("MT5 shutdown")
-
-# ------------------------
-# Market data helper
-# ------------------------
 
 def fetch_ohlc(symbol, timeframe, n=500):
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
@@ -111,63 +77,112 @@ def fetch_ohlc(symbol, timeframe, n=500):
     df.set_index('time', inplace=True)
     return df
 
-# ------------------------
-# Strategy logic
-# ------------------------
+def fetch_ohlc_m5(symbol, n=200):
+    return fetch_ohlc(symbol, M5_TIMEFRAME, n)
 
-def ema_atr_signals(df):
+def calculate_lot(symbol, sl_distance, risk_amount_usd=RISK_AMOUNT_USD):
+    info = mt5.symbol_info(symbol)
+    if not info:
+        return 0.1
+
+    contract_size = info.trade_contract_size or 100.0  # برای گلد = 100
+    vol_min  = info.volume_min or 0.01
+    vol_max  = info.volume_max or 100.0
+    vol_step = info.volume_step or 0.01
+
+    # ریسک واقعی برای هر لات (StopDistance * contract_size)
+    risk_per_lot = abs(sl_distance) * contract_size
+
+    if risk_per_lot <= 0:
+        logging.warning(f"[LotCalc] Invalid sl_distance={sl_distance}, fallback {vol_min}")
+        return vol_min
+
+    lot = risk_amount_usd / risk_per_lot
+
+    # محدودسازی و گرد کردن به استپ بروکر
+    lot = max(vol_min, min(lot, vol_max))
+    lot = round(lot / vol_step) * vol_step
+    lot = max(vol_min, min(lot, vol_max))
+
+    logging.info(
+        f"[LotCalc] Risk=${risk_amount_usd:.2f}, SL={sl_distance:.2f}, "
+        f"Contract={contract_size}, risk/lot={risk_per_lot:.2f}, lot={lot:.3f}"
+    )
+    return lot
+
+
+
+# ---------------- STRATEGY ----------------
+
+def ema_signals(df, df_m5=None):
     df = df.copy()
-    df['ema_fast'] = ta.trend.EMAIndicator(df['close'], window=EMA_FAST).ema_indicator()
-    df['ema_slow'] = ta.trend.EMAIndicator(df['close'], window=EMA_SLOW).ema_indicator()
+    df['ema9'] = ta.trend.EMAIndicator(df['close'], window=EMA_FAST).ema_indicator()
+    df['ema21'] = ta.trend.EMAIndicator(df['close'], window=EMA_SLOW).ema_indicator()
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_PERIOD).average_true_range()
+
+    if df_m5 is not None and ENABLE_M5_FILTER:
+        df_m5['ema9'] = ta.trend.EMAIndicator(df_m5['close'], window=M5_EMA_FAST).ema_indicator()
+        df_m5['ema21'] = ta.trend.EMAIndicator(df_m5['close'], window=M5_EMA_SLOW).ema_indicator()
+        trend_up = df_m5['ema9'].iat[-1] > df_m5['ema21'].iat[-1]
+        trend_down = df_m5['ema9'].iat[-1] < df_m5['ema21'].iat[-1]
+    else:
+        trend_up = trend_down = True
 
     df['signal'] = 0
     df['sl'] = pd.NA
     df['tp'] = pd.NA
 
+    # --- track cross state ---
+    static = getattr(ema_signals, 'cross_pending', {'up': False, 'down': False})
+
     i = len(df) - 1
-    if i < 2:
-        return df
-
-    ema9 = df['ema_fast'].iat[i]
-    ema21 = df['ema_slow'].iat[i]
+    ema9_now = df['ema9'].iat[i]
+    ema21_now = df['ema21'].iat[i]
+    ema9_prev = df['ema9'].iat[i - 1]
+    ema21_prev = df['ema21'].iat[i - 1]
     atr = df['atr'].iat[i]
-    last_close = df['close'].iat[i]
-    prev_close = df['close'].iat[i-1]
-    last_low = df['low'].iat[i]
-    last_high = df['high'].iat[i]
 
-    # BUY condition
-    if ema9 > ema21:
-        touched = last_low <= ema9
-        pullback_ok = (prev_close - last_low) >= (ATR_PULLBACK_MULT * atr)
-        confirmation = last_close > ema9
-        if touched and pullback_ok and confirmation:
-            entry = last_close
+    # Detect cross
+    cross_up = ema9_prev < ema21_prev and ema9_now > ema21_now
+    cross_down = ema9_prev > ema21_prev and ema9_now < ema21_now
+
+    if cross_up:
+        static['up'] = True
+        static['down'] = False
+    elif cross_down:
+        static['down'] = True
+        static['up'] = False
+
+    close_now = df['close'].iat[i]
+    low_now = df['low'].iat[i]
+    high_now = df['high'].iat[i]
+
+    # If pending BUY cross and touch ema9 later
+    if static['up'] and trend_up:
+        if low_now <= ema9_now and close_now > ema9_now and close_now > ema21_now:
+            entry = close_now
             sl = entry - ATR_SL_MULTIPLIER * atr
             tp = entry + ATR_TP_MULTIPLIER * atr
             df.at[df.index[i], 'signal'] = 1
             df.at[df.index[i], 'sl'] = sl
             df.at[df.index[i], 'tp'] = tp
+            static['up'] = False
 
-    # SELL condition
-    elif ema9 < ema21:
-        touched = last_high >= ema9
-        pullback_ok = (last_high - prev_close) >= (ATR_PULLBACK_MULT * atr)
-        confirmation = last_close < ema9
-        if touched and pullback_ok and confirmation:
-            entry = last_close
+    # If pending SELL cross and touch back ema9 later
+    if static['down'] and trend_down:
+        if high_now >= ema9_now and close_now < ema9_now and close_now < ema21_now:
+            entry = close_now
             sl = entry + ATR_SL_MULTIPLIER * atr
             tp = entry - ATR_TP_MULTIPLIER * atr
             df.at[df.index[i], 'signal'] = -1
             df.at[df.index[i], 'sl'] = sl
             df.at[df.index[i], 'tp'] = tp
+            static['down'] = False
 
+    ema_signals.cross_pending = static
     return df
 
-# ------------------------
-# Trading helpers
-# ------------------------
+# ---------------- TRADE HELPERS ----------------
 
 def get_open_positions(symbol, magic=MAGIC):
     try:
@@ -176,186 +191,165 @@ def get_open_positions(symbol, magic=MAGIC):
         return []
     if positions is None:
         return []
-    filtered = []
+    result = []
     for p in positions:
-        try:
-            if int(getattr(p, 'magic', -1)) == int(magic):
-                filtered.append(p)
-        except Exception:
-            filtered.append(p)
-    return filtered
+        if int(getattr(p, 'magic', -1)) == int(magic):
+            result.append(p)
+    return result
 
 
-def place_trade(symbol, signal, sl, tp, lot=LOT, deviation=20, magic=MAGIC):
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        logging.error(f"No tick for {symbol}")
+def place_trade(symbol, signal, sl, tp, lot, magic=MAGIC):
+    info = mt5.symbol_info(symbol)
+    if not info:
+        logging.error(f"Symbol info unavailable for {symbol}")
         return None
+
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        logging.error(f"No tick data for {symbol}")
+        return None
+
+    point = info.point if info.point>0 else 0.01
+    digits = info.digits if info.digits>0 else 3
+    min_gap = max((info.trade_stops_level or 0)*point, 5*point)
 
     if signal == 1:
-        price = float(tick.ask)
         order_type = mt5.ORDER_TYPE_BUY
+        price = float(tick.ask)
+        if sl >= price:
+            sl = round(price - (ATR_SL_MULTIPLIER * min_gap), digits)
+        if tp <= price:
+            tp = round(price + (ATR_TP_MULTIPLIER * min_gap), digits)
     elif signal == -1:
-        price = float(tick.bid)
         order_type = mt5.ORDER_TYPE_SELL
+        price = float(tick.bid)
+        if sl <= price:
+            sl = round(price + (ATR_SL_MULTIPLIER * min_gap), digits)
+        if tp >= price:
+            tp = round(price - (ATR_TP_MULTIPLIER * min_gap), digits)
     else:
+        logging.warning("Invalid signal passed to place_trade")
         return None
 
+    sl, tp, price = round(sl, digits), round(tp, digits), round(price, digits)
+
     request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(lot),
-        "type": order_type,
-        "price": price,
-        "sl": float(sl),
-        "tp": float(tp),
-        "deviation": deviation,
-        "magic": int(magic),
-        "comment": "EMA_ATR_Scalper",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        'action': mt5.TRADE_ACTION_DEAL,
+        'symbol': symbol,
+        'volume': lot,
+        'type': order_type,
+        'price': price,
+        'sl': sl,
+        'tp': tp,
+        'deviation': 20,
+        'magic': magic,
+        'type_time': mt5.ORDER_TIME_GTC,
+        'type_filling': mt5.ORDER_FILLING_IOC,
+        'comment': 'EMA_Cross_Retest_RiskBased'
     }
 
     result = mt5.order_send(request)
     if result is None:
         logging.error(f"order_send returned None: {mt5.last_error()}")
-        return None
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        logging.error(f"Order failed, retcode={result.retcode}, comment={result.comment}")
-        return result
+    elif result.retcode != mt5.TRADE_RETCODE_DONE:
+        logging.error(f"Order failed retcode={result.retcode} comment={result.comment}")
     else:
-        logging.info(f"Order placed: ticket={getattr(result, 'order', 'N/A')}, type={'BUY' if signal==1 else 'SELL'}, volume={lot}, sl={sl}, tp={tp}")
+        logging.info(f"Order placed OK: type={'BUY' if signal==1 else 'SELL'} lot={lot} sl={sl} tp={tp}")
     return result
 
-# ------------------------
-# Break-Even helper
-# ------------------------
 
-def check_and_move_breakeven(symbol, magic=MAGIC, atr_trigger=ATR_BREAK_EVEN_TRIGGER):
-    """
-    بررسی پوزیشن‌های باز و انتقال حدضرر به نقطه ورود (Break-Even)
-    وقتی قیمت حداقل atr_trigger * ATR در جهت موفقیت حرکت کرده باشد.
-    از متد رسمی TRADE_ACTION_SLTP برای متاتریدر۵ استفاده می‌کند.
-    """
+def check_and_move_breakeven(symbol, magic=MAGIC):
+    if not ENABLE_BREAK_EVEN:
+        return
     positions = get_open_positions(symbol, magic)
     if not positions:
         return
-
-    # گرفتن آخرین داده برای محاسبه ATR
-    df = fetch_ohlc(symbol, TIMEFRAME, n=100)
-    if df is None:
-        return
+    df = fetch_ohlc(symbol, TIMEFRAME, 100)
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_PERIOD).average_true_range()
     atr = df['atr'].iat[-1]
-
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         return
-
     for pos in positions:
-        try:
-            ticket = int(getattr(pos, "ticket", -1))
-            pos_type = int(pos.type)
-            price_open = float(pos.price_open)
-            tp = float(pos.tp)
-            sl = float(pos.sl)
-
-            if pos_type == mt5.ORDER_TYPE_BUY:
-                current_price = float(tick.bid)
-                profit_move = current_price - price_open
-            else:  # SELL
-                current_price = float(tick.ask)
-                profit_move = price_open - current_price
-
-            trigger_distance = atr_trigger * atr
-
-            # بررسی اگر قیمت به اندازه کافی در جهت معامله حرکت کرده
-            if profit_move >= trigger_distance and (
-                sl < price_open if pos_type == mt5.ORDER_TYPE_BUY else sl > price_open
-            ):
+        ticket = pos.ticket
+        pos_type = pos.type
+        price_open = pos.price_open
+        sl = pos.sl
+        tp = pos.tp
+        if pos_type == mt5.ORDER_TYPE_BUY:
+            current = tick.bid
+            profit_move = current - price_open
+            if profit_move >= atr * ATR_BREAK_EVEN_TRIGGER and sl < price_open:
                 new_sl = price_open
+            else:
+                continue
+        else:
+            current = tick.ask
+            profit_move = price_open - current
+            if profit_move >= atr * ATR_BREAK_EVEN_TRIGGER and sl > price_open:
+                new_sl = price_open
+            else:
+                continue
+        req = {
+            'action': mt5.TRADE_ACTION_SLTP,
+            'symbol': symbol,
+            'position': ticket,
+            'sl': new_sl,
+            'tp': tp,
+        }
+        mt5.order_send(req)
 
-                request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "symbol": symbol,
-                    "position": ticket,
-                    "sl": float(new_sl),
-                    "tp": float(tp),
-                }
-
-                result = mt5.order_send(request)
-                if result is None:
-                    logging.error(f"[BE] SLTP modify failed for ticket {ticket}: {mt5.last_error()}")
-                elif result.retcode != mt5.TRADE_RETCODE_DONE:
-                    logging.warning(
-                        f"[BE] Could not move SL to BE for ticket {ticket}. retcode={result.retcode}, comment={result.comment}"
-                    )
-                else:
-                    logging.info(f"[BE] SL moved to BE for ticket {ticket} ({'BUY' if pos_type==0 else 'SELL'})")
-        except Exception as e:
-            logging.exception(f"[BE] Error processing ticket {getattr(pos, 'ticket', '?')}: {e}")
-
-    
-# ------------------------
-# Main loop
-# ------------------------
+# ---------------- MAIN LOOP ----------------
 
 def main_loop():
     if not init_mt5():
-        logging.error("MT5 init/login failed — exiting")
+        logging.error('MT5 init failed.')
         return
-
-    # Ensure symbol exists in Market Watch
     sym = mt5.symbol_info(SYMBOL)
-    if sym is None:
-        logging.error(f"Symbol {SYMBOL} not found in MT5 market watch. Please add it and restart the script.")
-        shutdown_mt5()
-        return
-    if not sym.visible:
+    if sym is None or not sym.visible:
         mt5.symbol_select(SYMBOL, True)
-        logging.info(f"Selected {SYMBOL} in Market Watch")
+    logging.info('Start Cross+Pullback Scalper with Wait-for-Pullback Mode')
 
-    logging.info("Starting EMA9-EMA21 ATR Scalper main loop — CTRL+C to stop")
-
-    try:
-        while True:
-            df = fetch_ohlc(SYMBOL, TIMEFRAME, n=500)
-            if df is None:
-                logging.warning("No data fetched — retrying")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            df = ema_atr_signals(df)
-            last = df.iloc[-1]
-
-            # Try to move existing positions to break-even first
-            try:
-                check_and_move_breakeven(SYMBOL)
-            except Exception as e:
-                logging.exception(f"Error in break-even check: {e}")
-
-            if int(last['signal']) != 0:
-                positions = get_open_positions(SYMBOL, MAGIC)
-                if len(positions) >= MAX_ORDERS:
-                    logging.info(f"Max positions reached for {SYMBOL} — skipping signal")
-                else:
-                    signal = int(last['signal'])
-                    sl = float(last['sl'])
-                    tp = float(last['tp'])
-                    logging.info(f"Signal detected: {signal} — placing order with SL={sl} TP={tp}")
-                    place_trade(SYMBOL, signal, sl, tp)
-            else:
-                logging.debug("No signal on last candle")
-
+    while True:
+        df = fetch_ohlc(SYMBOL, TIMEFRAME, 500)
+        if df is None or len(df) < 50:
             time.sleep(POLL_INTERVAL)
+            continue
+        df_m5 = fetch_ohlc_m5(SYMBOL, 300)
 
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user — shutting down")
-    except Exception as e:
-        logging.exception(f"Unexpected error in main loop: {e}")
-    finally:
-        shutdown_mt5()
+        df = ema_signals(df, df_m5)
+        last = df.iloc[-1]
+        signal = last['signal']
 
+        # Break-even management
+        try:
+            check_and_move_breakeven(SYMBOL)
+        except Exception as e:
+            logging.warning(f"BE check error: {e}")
+
+        if signal == 0:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if len(get_open_positions(SYMBOL)) >= MAX_ORDERS:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        sl, tp = float(last['sl']), float(last['tp'])
+        sl_distance = abs(last['close'] - sl)
+        lot = calculate_lot(SYMBOL, sl_distance)
+
+        res = place_trade(SYMBOL, signal, sl, tp, lot)
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            logging.info(f"Trade opened ({'BUY' if signal==1 else 'SELL'}) lot={lot:.3f}")
+        else:
+            logging.warning(f"Trade failed: {res.retcode if res else 'None'}")
+
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == '__main__':
-    main_loop()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        shutdown_mt5()
+        logging.info('Stopped by user')
