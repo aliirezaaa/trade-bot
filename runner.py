@@ -1,8 +1,7 @@
-# File: runner.py
-# نسخه به‌روز شده برای کار با backtest_engine جدید
+# File: runner.py (نسخه نهایی و اصلاح شده)
 
 import sys
-from backtest_engine import BacktestBroker
+from backtest_engine import BacktestBroker  # اطمینان از اینکه نام کلاس درست است
 
 # --- استراتژی‌های خود را اینجا وارد کنید ---
 # هر دو استراتژی را وارد می‌کنیم تا بتوانیم به راحتی بین آنها سوییچ کنیم
@@ -19,8 +18,8 @@ from ema_strategy import EmaPullbackStrategy
 STRATEGY_TO_RUN = 'EMA' # <--- اینجا استراتژی مورد نظر را انتخاب کنید
 
 # ۲. مسیر فایل داده‌ها
-# توجه: موتور جدید انتظار فرمت خاصی برای CSV دارد (در توضیحات پایین گفته شده)
-BACKTEST_DATA_FILE = 'XAUUSD.csv'
+# فرمت مورد نیاز: 6 ستون (datetime,open,high,low,close,volume) با کاما جدا شده
+BACKTEST_DATA_FILE = 'XAUUSD.csv' # <--- نام فایل دیتای خود را اینجا قرار دهید
 
 # ۳. تنظیمات کلی بک‌تست
 INITIAL_BALANCE = 10000.0
@@ -31,11 +30,9 @@ COMMISSION = 0.0 # هزینه کمیسیون برای هر معامله (در ح
 STRATEGY_PARAMS = {
     'SMC': {
         'risk_to_reward': 2.0,
-        # پارامترهای آینده استراتژی SMC را اینجا اضافه کنید
     },
     'EMA': {
-        'risk_to_reward': 1.5,
-        # پارامترهای آینده استراتژی EMA را اینجا اضافه کنید
+        'risk_to_reward': 2,
     }
 }
 
