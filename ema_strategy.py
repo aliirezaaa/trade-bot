@@ -10,7 +10,7 @@ class EmaPullbackStrategy:
     در اولین پولبک وارد معامله می‌شود.
     """
 
-    def __init__(self, broker, risk_to_reward: float, atr_period=14, ema_slow=21, ema_fast=9, impulse_atr_multiplier=0.4, sl_atr_multiplier=0.5):
+    def __init__(self, broker, risk_to_reward: float, atr_period=14, ema_slow=21, ema_fast=9, impulse_atr_multiplier=0.8, sl_atr_multiplier=0.5):
         """
         سازنده کلاس استراتژی.
         """
