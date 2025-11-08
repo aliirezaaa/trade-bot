@@ -1,27 +1,19 @@
+# File: ema_strategy.py (نسخه نهایی و کاملاً اصلاح شده بر اساس کد شما)
+
 import pandas as pd
 import pandas_ta as ta
 
 class EmaPullbackStrategy:
     """
-    استراتژی معاملاتی بر اساس پولبک به EMA 20 در جهت روند EMA 50.
+    استراتژی معاملاتی بر اساس پولبک به EMA در جهت روند کلی.
     این استراتژی ابتدا منتظر یک حرکت قدرتمند (Impulse) می‌ماند و سپس
-    در اولین پولبک به EMA 20 وارد معامله می‌شود.
+    در اولین پولبک وارد معامله می‌شود.
     """
 
     def __init__(self, broker, risk_to_reward: float, atr_period=14, ema_slow=21, ema_fast=9, impulse_atr_multiplier=0.4, sl_atr_multiplier=0.5):
         """
         سازنده کلاس استراتژی.
-
-        Args:
-            broker: یک نمونه از کلاس BacktestBroker برای دسترسی به داده‌ها و اجرای معاملات.
-            risk_to_reward (float): نسبت ریسک به ریوارد برای تعیین حد سود.
-            atr_period (int): دوره زمانی برای محاسبه ATR.
-            ema_slow (int): دوره زمانی برای EMA کند (تعیین روند).
-            ema_fast (int): دوره زمانی برای EMA سریع (نقطه ورود).
-            impulse_atr_multiplier (float): ضریبی از ATR که قیمت باید از EMA سریع فاصله بگیرد تا Impulse تایید شود.
-            sl_atr_multiplier (float): ضریبی از ATR برای محاسبه فاصله حد ضرر از EMA کند.
         """
-        # ۱. [اصلاح اصلی] پارامتر broker اضافه و ذخیره شد
         self.broker = broker
         
         # --- پارامترهای استراتژی ---
@@ -32,40 +24,52 @@ class EmaPullbackStrategy:
         self.impulse_atr_multiplier = impulse_atr_multiplier
         self.sl_atr_multiplier = sl_atr_multiplier
 
-        # ۲. [اصلاح اصلی] متغیر N_BARS_FOR_ENTRY برای موتور بک‌تست اضافه شد
-        # باید به اندازه کافی بزرگ باشد تا طولانی‌ترین اندیکاتور (EMA 50) محاسبه شود
+        # تعداد کندل‌های مورد نیاز برای محاسبه اندیکاتورها
         self.N_BARS_FOR_ENTRY = 100 
 
-        # --- مدیریت وضعیت ---
-        self.position_open = False
+        # --- مدیریت وضعیت داخلی استراتژی ---
         self.impulse_confirmed = {'BUY': False, 'SELL': False}
 
         print("✅ EmaPullbackStrategy Initialized.")
 
-    def signal_position_closed(self):
+    def signal_position_closed(self, trade):
         """این متد توسط موتور بک‌تست فراخوانی می‌شود تا به استراتژی اطلاع دهد معامله بسته شده است."""
-        self.position_open = False
-        self.impulse_confirmed = {'BUY': False, 'SELL': False} # ریست کردن وضعیت برای ستاپ بعدی
-        # print("INFO (EMA Strategy): Position closed signal received. Ready for new setups.")
+        # ریست کردن وضعیت برای جستجوی ستاپ بعدی
+        self.impulse_confirmed = {'BUY': False, 'SELL': False} 
+        print(f"  STRATEGY NOTIFIED: Position closed. PnL: ${trade.get('pnl', 0):.2f}. Ready for new setup.")
 
-
-    def on_bar(self, candles: pd.DataFrame):
+    def on_bar(self, current_bar):
         """
         این متد اصلی استراتژی است که به ازای هر کندل جدید توسط موتور بک‌تست فراخوانی می‌شود.
         """
-        # اگر معامله باز داریم، هیچ کاری انجام نده
-        if self.position_open:
-            return None
+        # <<< تغییر ۱: چک کردن معامله باز از طریق بروکر >>>
+        # به جای self.position_open از self.broker.open_positions استفاده می‌کنیم
+        if self.broker.open_positions:
+            return
+
+        # دریافت داده‌های تاریخی برای تحلیل
+        candles = self.broker.get_historical_data(self.N_BARS_FOR_ENTRY)
+        if candles.empty or len(candles) < self.N_BARS_FOR_ENTRY:
+            return
 
         # ۱. محاسبه اندیکاتورها
         self._calculate_indicators(candles)
         
+        # اطمینان از اینکه داده کافی برای تحلیل وجود دارد
+        if len(candles) < 2:
+            return
+            
         last_candle = candles.iloc[-1]
         prev_candle = candles.iloc[-2]
+        
+        # اطمینان از وجود مقادیر اندیکاتور
+        required_cols = [f'EMA_{self.ema_slow_period}', f'EMA_{self.ema_fast_period}', 'ATR']
+        if any(col not in last_candle or pd.isna(last_candle[col]) for col in required_cols):
+            return
 
         # ۲. بررسی شرایط روند کلی
-        is_uptrend = last_candle['EMA_50'] < last_candle['close']
-        is_downtrend = last_candle['EMA_50'] > last_candle['close']
+        is_uptrend = last_candle[f'EMA_{self.ema_slow_period}'] < last_candle['close']
+        is_downtrend = last_candle[f'EMA_{self.ema_slow_period}'] > last_candle['close']
         
         trade_signal = None
 
@@ -75,73 +79,69 @@ class EmaPullbackStrategy:
         elif is_downtrend:
             trade_signal = self._check_sell_setup(last_candle, prev_candle)
         
-        # اگر سیگنالی تولید شد، آن را برگردان
+        # <<< تغییر ۲: اجرای مستقیم سیگنال به جای return کردن آن >>>
         if trade_signal:
-            self.position_open = True # قفل کردن استراتژی تا زمان بسته شدن معامله
-        
-        return trade_signal
+            print(f"  => SIGNAL FOUND: {trade_signal['type']}. Placing order.")
+            # به جای return کردن دیکشنری، مستقیماً به بروکر دستور می‌دهیم
+            # حجم معامله دیگر اینجا مشخص نمی‌شود و موتور آن را محاسبه می‌کند
+            self.broker.place_market_order(
+                direction=trade_signal['type'],
+                sl=trade_signal['sl'],
+                tp=trade_signal['tp']
+            )
 
     def _calculate_indicators(self, candles: pd.DataFrame):
         """محاسبه و افزودن اندیکاتورهای مورد نیاز به دیتافریم."""
         candles['ATR'] = ta.atr(candles['high'], candles['low'], candles['close'], length=self.atr_period)
-        candles['EMA_50'] = ta.ema(candles['close'], length=self.ema_slow_period)
-        candles['EMA_20'] = ta.ema(candles['close'], length=self.ema_fast_period)
+        # <<< تغییر ۳: استفاده از نام‌های داینامیک برای EMA >>>
+        candles[f'EMA_{self.ema_slow_period}'] = ta.ema(candles['close'], length=self.ema_slow_period)
+        candles[f'EMA_{self.ema_fast_period}'] = ta.ema(candles['close'], length=self.ema_fast_period)
         candles.dropna(inplace=True)
 
     def _check_buy_setup(self, last, prev):
         """بررسی شرایط برای یک ستاپ خرید."""
-        # ابتدا باید یک حرکت ایمپالس تایید شود
+        ema_fast = last[f'EMA_{self.ema_fast_period}']
+        ema_slow = last[f'EMA_{self.ema_slow_period}']
+
         if not self.impulse_confirmed['BUY']:
             impulse_distance = self.impulse_atr_multiplier * last['ATR']
-            # اگر قیمت به اندازه کافی از EMA 20 فاصله گرفت، ایمپالس تایید می‌شود
-            if last['high'] > (last['EMA_20'] + impulse_distance):
+            if last['high'] > (ema_fast + impulse_distance):
                 self.impulse_confirmed['BUY'] = True
-                self.impulse_confirmed['SELL'] = False # ریست کردن جهت مخالف
-                # print(f"IMPULSE BUY Confirmed at {last.name}")
+                self.impulse_confirmed['SELL'] = False
             return None
 
-        # اگر ایمپالس تایید شده است، حالا منتظر پولبک هستیم
-        # شرط پولبک: قیمت از بالای EMA 20 عبور کرده و به آن برگردد
-        if prev['low'] > prev['EMA_20'] and last['low'] <= last['EMA_20']:
-            entry_price = last['EMA_20']
-            sl = last['EMA_50'] - (self.sl_atr_multiplier * last['ATR'])
+        if prev['low'] > ema_fast and last['low'] <= ema_fast:
+            entry_price = ema_fast
+            sl = ema_slow - (self.sl_atr_multiplier * last['ATR'])
             
-            # اطمینان از اینکه حد ضرر منطقی است
             if entry_price <= sl:
                 return None
 
             tp = entry_price + (self.risk_to_reward * (entry_price - sl))
-            
-            # print(f"BUY Signal at {last.name}: Entry={entry_price:.2f}, SL={sl:.2f}, TP={tp:.2f}")
             return {'type': 'BUY', 'entry_price': entry_price, 'sl': sl, 'tp': tp}
         
         return None
 
     def _check_sell_setup(self, last, prev):
         """بررسی شرایط برای یک ستاپ فروش."""
-        # ابتدا باید یک حرکت ایمپالس تایید شود
+        ema_fast = last[f'EMA_{self.ema_fast_period}']
+        ema_slow = last[f'EMA_{self.ema_slow_period}']
+
         if not self.impulse_confirmed['SELL']:
             impulse_distance = self.impulse_atr_multiplier * last['ATR']
-            # اگر قیمت به اندازه کافی از EMA 20 فاصله گرفت، ایمپالس تایید می‌شود
-            if last['low'] < (last['EMA_20'] - impulse_distance):
+            if last['low'] < (ema_fast - impulse_distance):
                 self.impulse_confirmed['SELL'] = True
-                self.impulse_confirmed['BUY'] = False # ریست کردن جهت مخالف
-                # print(f"IMPULSE SELL Confirmed at {last.name}")
+                self.impulse_confirmed['BUY'] = False
             return None
 
-        # اگر ایمپالس تایید شده است، حالا منتظر پولبک هستیم
-        # شرط پولبک: قیمت از پایین EMA 20 عبور کرده و به آن برگردد
-        if prev['high'] < prev['EMA_20'] and last['high'] >= last['EMA_20']:
-            entry_price = last['EMA_20']
-            sl = last['EMA_50'] + (self.sl_atr_multiplier * last['ATR'])
+        if prev['high'] < ema_fast and last['high'] >= ema_fast:
+            entry_price = ema_fast
+            sl = ema_slow + (self.sl_atr_multiplier * last['ATR'])
 
-            # اطمینان از اینکه حد ضرر منطقی است
             if entry_price >= sl:
                 return None
 
             tp = entry_price - (self.risk_to_reward * (sl - entry_price))
-            
-            # print(f"SELL Signal at {last.name}: Entry={entry_price:.2f}, SL={sl:.2f}, TP={tp:.2f}")
             return {'type': 'SELL', 'entry_price': entry_price, 'sl': sl, 'tp': tp}
         
         return None

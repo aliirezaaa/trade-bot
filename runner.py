@@ -1,40 +1,27 @@
-# File: runner.py (نسخه نهایی و اصلاح شده)
+# File: runner.py (نسخه جدید برای ریسک ثابت دلاری)
 
-import sys
-from backtest_engine import BacktestBroker  # اطمینان از اینکه نام کلاس درست است
-
-# --- استراتژی‌های خود را اینجا وارد کنید ---
-# هر دو استراتژی را وارد می‌کنیم تا بتوانیم به راحتی بین آنها سوییچ کنیم
-from bot_strategy import BotStrategy
+from backtest_engine import BacktestEngine
 from ema_strategy import EmaPullbackStrategy
-
+# اگر استراتژی‌های دیگری دارید، آنها را نیز وارد کنید
+# from smc_strategy import SmcStrategy 
 
 # ==============================================================================
 # --- CONFIGURATION - تمام تنظیمات را اینجا انجام دهید ---
 # ==============================================================================
 
-# ۱. انتخاب استراتژی برای اجرا
-# 'SMC' یا 'EMA' را انتخاب کنید
-STRATEGY_TO_RUN = 'EMA' # <--- اینجا استراتژی مورد نظر را انتخاب کنید
+# ۱. مسیر فایل داده‌ها
+BACKTEST_DATA_FILE = 'XAUUSD.csv' # نام فایل داده خود را وارد کنید
 
-# ۲. مسیر فایل داده‌ها
-# فرمت مورد نیاز: 6 ستون (datetime,open,high,low,close,volume) با کاما جدا شده
-BACKTEST_DATA_FILE = 'XAUUSD.csv' # <--- نام فایل دیتای خود را اینجا قرار دهید
-
-# ۳. تنظیمات کلی بک‌تست
+# ۲. موجودی اولیه حساب
 INITIAL_BALANCE = 10000.0
-COMMISSION = 0.0 # هزینه کمیسیون برای هر معامله (در حال حاضر صفر)
 
-# ۴. پارامترهای مخصوص هر استراتژی
-# این پارامترها به صورت خودکار به استراتژی انتخاب شده پاس داده می‌شوند
-STRATEGY_PARAMS = {
-    'SMC': {
-        'risk_to_reward': 2.0,
-    },
-    'EMA': {
-        'risk_to_reward': 2,
-    }
-}
+# ۳. [تغییر اصلی] ریسک ثابت دلاری برای هر معامله
+RISK_PER_TRADE_USD = 50.0  # هر معامله حداکثر 50 دلار ریسک خواهد داشت
+
+# ۴. مشخصات نماد معاملاتی (بسیار مهم برای محاسبه صحیح لات)
+# این مقادیر باید با نمادی که بک‌تست می‌گیرید مطابقت داشته باشد
+SYMBOL_PIP_SIZE = 0.01      # برای طلا (XAUUSD) معمولا 0.01 است
+SYMBOL_PIP_VALUE_PER_LOT = 10.0 # برای جفت‌ارزهای XXX/USD و طلا معمولا 10 دلار است
 
 # ==============================================================================
 # --- SCRIPT EXECUTION ---
@@ -42,34 +29,17 @@ STRATEGY_PARAMS = {
 
 if __name__ == "__main__":
     
-    strategy_map = {
-        'SMC': BotStrategy,
-        'EMA': EmaPullbackStrategy
-    }
-
-    if STRATEGY_TO_RUN not in strategy_map:
-        print(f"❌ خطای پیکربندی: استراتژی '{STRATEGY_TO_RUN}' تعریف نشده است.")
-        print(f"   گزینه‌های معتبر: {list(strategy_map.keys())}")
-        sys.exit()
-
-    print(f"--- شروع بک‌تست برای استراتژی: {STRATEGY_TO_RUN} ---")
-
-    # انتخاب کلاس استراتژی و پارامترهای آن بر اساس تنظیمات
-    selected_strategy_class = strategy_map[STRATEGY_TO_RUN]
-    selected_strategy_params = STRATEGY_PARAMS[STRATEGY_TO_RUN]
-
-    # ۱. ساخت موتور بک‌تست
-    # موتور بک‌تست خودش استراتژی را با پارامترهای لازم می‌سازد
-    engine = BacktestBroker(
-        data_path=BACKTEST_DATA_FILE,
-        strategy_class=selected_strategy_class,
+    print("--- Initializing Backtest ---")
+    
+    # ساخت موتور بک‌تست و پاس دادن تنظیمات جدید
+    engine = BacktestEngine(
+        csv_filepath=BACKTEST_DATA_FILE,
+        strategy_class=EmaPullbackStrategy, # استراتژی مورد نظر خود را اینجا انتخاب کنید
         initial_balance=INITIAL_BALANCE,
-        commission_per_trade=COMMISSION,
-        **selected_strategy_params  # پاس دادن پارامترهای استراتژی
+        risk_per_trade_usd=RISK_PER_TRADE_USD, # ارسال پارامتر جدید
+        pip_size=SYMBOL_PIP_SIZE,
+        pip_value_per_lot=SYMBOL_PIP_VALUE_PER_LOT
     )
 
-    # ۲. اجرای بک‌تست
-    # متد run() حلقه اصلی را اجرا کرده و در پایان گزارش را چاپ می‌کند
+    # اجرای بک‌تست
     engine.run()
-
-    print("\n--- بک‌تست به پایان رسید ---")

@@ -1,240 +1,204 @@
-# File: backtest_engine.py (نسخه نهایی و صحیح)
+# File: backtest_engine.py (نسخه نهایی با ریسک ثابت دلاری - بر اساس فایل شما)
 
 import pandas as pd
+import os
 from tqdm import tqdm
-import sys
 
-class BacktestBroker:
-    """
-    موتور بک‌تست که مسئولیت مدیریت داده‌ها، اجرای استراتژی و گزارش‌گیری را بر عهده دارد.
-    """
-    def __init__(self, data_path, strategy_class, initial_balance=10000.0, commission_per_trade=0.0, **strategy_params):
-        """
-        سازنده موتور بک‌تست.
-        
-        Args:
-            data_path (str): مسیر فایل CSV داده‌ها.
-            strategy_class: کلاس استراتژی که باید اجرا شود (مثلا BotStrategy).
-            initial_balance (float): موجودی اولیه حساب.
-            commission_per_trade (float): هزینه کمیسیون برای هر معامله.
-            **strategy_params: پارامترهای اضافی که مستقیما به استراتژی پاس داده می‌شوند.
-        """
-        self.data_path = data_path
-        self.df = self._load_data()
-        if self.df is None:
-            sys.exit("برنامه به دلیل عدم بارگذاری داده متوقف شد.")
-
-        # --- مدیریت مالی و معاملات ---
+class BacktestEngine:
+    # <<< تغییر ۱: پارامتر ورودی از risk_per_trade_percent به risk_per_trade_usd تغییر کرد >>>
+    def __init__(self, csv_filepath, strategy_class, initial_balance=10000.0, risk_per_trade_usd=50.0, pip_size=0.0001, pip_value_per_lot=10.0):
+        self.data_path = csv_filepath
         self.initial_balance = initial_balance
         self.balance = initial_balance
-        self.commission = commission_per_trade
-        self.open_trade = None
+        
+        # <<< تغییر ۲: ذخیره کردن ریسک ثابت دلاری >>>
+        self.risk_per_trade_usd = risk_per_trade_usd
+        
+        self.df = self._load_data(csv_filepath)
+        if self.df is None or self.df.empty:
+            raise ValueError("Data could not be loaded. Aborting.")
+
+        # شما می‌توانید پارامترهای استراتژی را از runner.py به اینجا پاس دهید
+        self.strategy = strategy_class(broker=self, risk_to_reward=2.0) 
+
+        self.current_tick_index = 0
+        self.open_positions = []
         self.trade_history = []
         
-        # --- ساخت استراتژی ---
-        # موتور بک‌تست (self) به عنوان بروکر به استراتژی معرفی می‌شود
-        self.strategy = strategy_class(broker=self, **strategy_params)
-        
-        self.current_tick_index = 0
-        print(f"✅ BacktestBroker Initialized. Initial Balance: ${self.initial_balance:,.2f}")
-        print(f"   - Strategy: {strategy_class.__name__}")
-        print(f"   - Data loaded successfully. Shape: {self.df.shape}")
+        # --- مشخصات نماد (اکنون از ورودی دریافت می‌شود) ---
+        self.min_lot = 0.01
+        self.pip_size = pip_size
+        self.pip_value_per_lot = pip_value_per_lot
 
-
-    def _load_data(self):
-        """
-        داده‌ها را از فایل CSV/TXT با فرمت جدید بارگذاری می‌کند.
-        فرمت مورد انتظار: 9 ستون تب-جداشده، بدون هدر
-        (date, time, open, high, low, close, tick_volume, spread, real_volume)
-        """
+    def _load_data(self, csv_filepath):
+        if not os.path.exists(csv_filepath):
+            print(f"❌ ERROR: Historical data file not found at: {csv_filepath}")
+            return None
         try:
-            # تعریف نام ستون‌ها به ترتیب موجود در فایل
-            column_names = [
-                'date', 'time', 'open', 'high', 'low', 'close', 
-                'tick_volume', 'spread', 'real_volume'
-            ]
-
-            df = pd.read_csv(
-                self.data_path,
-                sep='\t',  # ۱. مشخص کردن جداکننده تب
-                header=None, # ۲. اعلام اینکه فایل هدر ندارد
-                names=column_names, # ۳. اختصاص دادن نام به ستون‌ها
-                # ۴. ترکیب دو ستون اول (date, time) برای ساخت یک ستون datetime
-                parse_dates={'datetime': ['date', 'time']},
-                # ۵. قرار دادن ستون datetime به عنوان ایندکس دیتافریم
-                index_col='datetime' 
-            )
-
-            # تغییر نام ستون حجم برای هماهنگی با استانداردهای رایج
-            df.rename(columns={'tick_volume': 'volume'}, inplace=True)
-            
-            # اطمینان از اینکه ستون‌های مورد نیاز وجود دارند
-            required_cols = ['open', 'high', 'low', 'close']
-            if not all(col in df.columns for col in required_cols):
-                print(f"❌ خطا: فایل داده پس از پردازش، شامل ستون‌های {required_cols} نیست.")
-                return None
-                
-            # انتخاب فقط ستون‌های ضروری برای جلوگیری از مصرف حافظه اضافی
-            # این کار اختیاری است اما کد را تمیزتر می‌کند
-            df = df[['open', 'high', 'low', 'close', 'volume']]
-            
-            print("✅ داده‌ها با فرمت جدید (تب-جداشده) با موفقیت بارگذاری شد.")
-            return df
-            
-        except FileNotFoundError:
-            print(f"❌ خطا: فایل داده در مسیر '{self.data_path}' یافت نشد.")
-            return None
+            # این بخش برای خواندن فایل‌های استاندارد CSV با هدر است
+            try:
+                df = pd.read_csv(csv_filepath, parse_dates=['datetime'], index_col='datetime')
+                print(f"✅ Data loaded successfully from standard CSV. {len(df)} bars.")
+                return df
+            except (ValueError, KeyError):
+                 # اگر فرمت بالا ناموفق بود، فرمت تب-جداشده متاتریدر را امتحان می‌کند
+                print("Standard CSV failed, trying MT5 tab-separated format...")
+                df = pd.read_csv(
+                    csv_filepath,
+                    sep='\t',
+                    header=None,
+                    names=['date', 'time', 'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume']
+                )
+                df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M:%S')
+                df.set_index('datetime', inplace=True)
+                df.drop(['date', 'time', 'spread', 'real_volume'], axis=1, inplace=True)
+                print(f"✅ Data loaded successfully from MT5 format. {len(df)} bars.")
+                return df
         except Exception as e:
-            print(f"❌ خطا در هنگام بارگذاری یا پردازش فایل داده: {e}")
+            print(f"❌ ERROR: Failed to load or parse data file. Error: {e}")
             return None
+
+    def get_current_bar(self):
+        return self.df.iloc[self.current_tick_index]
 
     def get_historical_data(self, n_bars: int):
-        """
-        داده‌های تاریخی تا کندل فعلی را به استراتژی می‌دهد.
-        """
         if self.current_tick_index < n_bars:
-            return pd.DataFrame() # دیتای کافی وجود ندارد
-        
+            return pd.DataFrame()
         start_index = self.current_tick_index - n_bars
-        # از iloc برای انتخاب بر اساس موقعیت عددی استفاده می‌کنیم
         return self.df.iloc[start_index:self.current_tick_index].copy()
 
-    def advance_time(self):
-        """زمان را یک کندل به جلو می‌برد."""
-        if self.current_tick_index >= len(self.df):
-            return False # پایان داده‌ها
-        
-        self.current_tick_index += 1
-        return True
-
     def run(self):
-        """حلقه اصلی بک‌تست را اجرا می‌کند."""
         print("\n--- Starting backtest... ---")
-        
-        # اطمینان از وجود N_BARS_FOR_ENTRY در استراتژی
-        if not hasattr(self.strategy, 'N_BARS_FOR_ENTRY'):
-             print("❌ خطای استراتژی: متغیر 'N_BARS_FOR_ENTRY' در کلاس استراتژی تعریف نشده است.")
-             return
-
-        # حلقه اصلی بک‌تست
+        print(f"Risk model: Fixed Amount (${self.risk_per_trade_usd:.2f} per trade)")
         for i in tqdm(range(len(self.df)), desc="Backtesting Progress"):
-            self.current_tick_index = i + 1
+            self.current_tick_index = i
             
-            # 1. مدیریت معامله باز (چک کردن SL/TP)
-            if self.open_trade:
-                self._check_open_trades()
-
-            # 2. دریافت داده‌های تاریخی و ارسال به استراتژی
-            # فقط در صورتی که دیتای کافی برای تحلیل وجود داشته باشد
-            if i >= self.strategy.N_BARS_FOR_ENTRY:
-                historical_candles = self.get_historical_data(self.strategy.N_BARS_FOR_ENTRY)
-                
-                # فراخوانی متد اصلی استراتژی
-                trade_signal = self.strategy.on_bar(historical_candles)
-                
-                if trade_signal:
-                    self._execute_trade(trade_signal)
-
-        print("\n--- Backtest finished. ---")
+            self._check_open_trades()
+            
+            current_bar = self.get_current_bar()
+            self.strategy.on_bar(current_bar)
+            
         self._generate_report()
 
-    def _execute_trade(self, trade_signal: dict):
-        """یک سیگنال معاملاتی را اجرا می‌کند."""
-        if self.open_trade is not None:
-            # print("INFO: Trade signal received but a position is already open. Signal ignored.")
+    def _check_open_trades(self):
+        if not self.open_positions:
+            return
+        
+        positions_to_close = []
+        current_bar = self.get_current_bar()
+        
+        for pos in self.open_positions:
+            pnl = 0
+            closed_by = None
+            
+            if pos['direction'] == 'BUY':
+                if current_bar['low'] <= pos['sl']:
+                    closed_by, close_price = 'SL', pos['sl']
+                elif current_bar['high'] >= pos['tp']:
+                    closed_by, close_price = 'TP', pos['tp']
+            elif pos['direction'] == 'SELL':
+                if current_bar['high'] >= pos['sl']:
+                    closed_by, close_price = 'SL', pos['sl']
+                elif current_bar['low'] <= pos['tp']:
+                    closed_by, close_price = 'TP', pos['tp']
+
+            if closed_by:
+                pnl_pips = (close_price - pos['entry_price']) / self.pip_size if pos['direction'] == 'BUY' else (pos['entry_price'] - close_price) / self.pip_size
+                pnl = pnl_pips * self.pip_value_per_lot * pos['volume']
+                
+                self.balance += pnl
+                pos['pnl'] = pnl
+                pos['close_price'] = close_price
+                pos['close_time'] = current_bar.name
+                self.trade_history.append(pos)
+                positions_to_close.append(pos)
+                
+                result_icon = '🔴' if pnl < 0 else '🟢'
+                print(f"\n{result_icon} Position Closed by {closed_by}: {pos['direction']} {pos['volume']} lot. PnL: ${pnl:.2f}. Balance: ${self.balance:.2f}")
+
+        if positions_to_close:
+            self.open_positions = [p for p in self.open_positions if p not in positions_to_close]
+            if hasattr(self.strategy, 'signal_position_closed'):
+                for closed_pos in positions_to_close:
+                    self.strategy.signal_position_closed(closed_pos)
+
+
+    def _calculate_lot_size(self, risk_amount_usd, sl_pips):
+        if sl_pips <= 0: return 0
+        value_per_pip = risk_amount_usd / sl_pips
+        lot_size = value_per_pip / self.pip_value_per_lot
+        # گرد کردن به نزدیک‌ترین 0.01 (گام استاندارد لات)
+        lot_size_rounded = round(lot_size / self.min_lot) * self.min_lot
+        return max(self.min_lot, lot_size_rounded)
+
+    def place_market_order(self, direction, sl, tp):
+        if self.open_positions:
             return
 
-        current_time = self.df.index[self.current_tick_index - 1]
+        # <<< تغییر ۳: استفاده مستقیم از مبلغ ریسک ثابت به جای محاسبه درصدی >>>
+        risk_amount_usd = self.risk_per_trade_usd
         
-        self.open_trade = {
-            'type': trade_signal['type'],
-            'entry_price': trade_signal['entry_price'],
-            'sl': trade_signal['sl'],
-            'tp': trade_signal['tp'],
-            'entry_time': current_time,
-            'status': 'open'
+        current_bar = self.get_current_bar()
+        entry_price = current_bar['close']
+
+        sl_pips = abs(entry_price - sl) / self.pip_size
+        
+        if sl_pips == 0:
+            print("  ⚠️ SL distance is zero. Skipping trade.")
+            return
+
+        lot_size = self._calculate_lot_size(risk_amount_usd, sl_pips)
+
+        if lot_size < self.min_lot:
+            print(f"  ⚠️ Calculated lot size ({lot_size}) is below minimum. Skipping trade.")
+            return
+
+        position = {
+            'direction': direction,
+            'volume': lot_size,
+            'entry_price': entry_price,
+            'sl': sl,
+            'tp': tp,
+            'entry_time': current_bar.name
         }
-        # print(f"\n✅ TRADE OPENED at {current_time}: {trade_signal}")
-
-    def _check_open_trades(self):
-        """وضعیت معامله باز را در هر کندل بررسی می‌کند."""
-        if self.open_trade is None:
-            return None
-
-        current_bar = self.df.iloc[self.current_tick_index - 1]
-        trade = self.open_trade
-        
-        hit = None
-        pnl = 0
-
-        if trade['type'] == 'BUY':
-            if current_bar['low'] <= trade['sl']:
-                hit = 'SL'
-            elif current_bar['high'] >= trade['tp']:
-                hit = 'TP'
-        elif trade['type'] == 'SELL':
-            if current_bar['high'] >= trade['sl']:
-                hit = 'SL'
-            elif current_bar['low'] <= trade['tp']:
-                hit = 'TP'
-        
-        if hit:
-            exit_price = trade[hit.lower()]
-            pnl = (exit_price - trade['entry_price']) if trade['type'] == 'BUY' else (trade['entry_price'] - exit_price)
-            
-            # بستن معامله
-            trade['status'] = 'closed'
-            trade['exit_time'] = current_bar.name
-            trade['exit_price'] = exit_price
-            trade['pnl'] = pnl
-            trade['result'] = 'Win' if hit == 'TP' else 'Loss'
-            
-            self.trade_history.append(trade)
-            self.balance += pnl # ساده‌سازی: محاسبه PnL بدون در نظر گرفتن حجم
-            self.open_trade = None
-            
-            # اطلاع به استراتژی که معامله بسته شده است
-            if hasattr(self.strategy, 'signal_position_closed'):
-                self.strategy.signal_position_closed()
-            
-            return trade
-        return None
-
+        self.open_positions.append(position)
+        print(f"\n🔵 New Position Opened: {direction} {lot_size} lot @ {entry_price:.5f}, SL={sl:.5f}, TP={tp:.5f}. Risking ~${risk_amount_usd:.2f}")
 
     def _generate_report(self):
-        """یک گزارش نهایی از نتایج بک‌تست تولید و چاپ می‌کند."""
-        print("\n--- Backtest Report ---")
+        print("\n" + "="*50)
+        print("--- Backtest Finished: Results ---")
+        print("="*50)
         
-        # بخش ۱: خلاصه وضعیت مالی
-        print(f"Initial Balance: ${self.initial_balance:,.2f}")
-        print(f"Final Balance:   ${self.balance:,.2f}")
-        
-        total_pnl = self.balance - self.initial_balance
-        # جلوگیری از خطای تقسیم بر صفر اگر بالانس اولیه صفر باشد
-        pnl_percentage = (total_pnl / self.initial_balance) * 100 if self.initial_balance != 0 else 0.0
-        
-        print(f"Total Net PnL:   ${total_pnl:,.2f} ({pnl_percentage:.2f}%)")
-        print("-" * 25)
-
-        if not self.trade_history:
+        total_trades = len(self.trade_history)
+        if total_trades == 0:
             print("No trades were executed.")
+            print(f"Final Balance:   ${self.balance:,.2f}")
             return
 
-        # بخش ۲: آمار معاملات
-        total_trades = len(self.trade_history)
-        wins = len([t for t in self.trade_history if t['result'] == 'Win'])
-        losses = total_trades - wins
-        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        pnl = self.balance - self.initial_balance
+        pnl_percent = (pnl / self.initial_balance) * 100
 
-        # محاسبه Profit Factor (مجموع سودها تقسیم بر مجموع ضررها)
-        total_win_pnl = sum(t['pnl'] for t in self.trade_history if t['result'] == 'Win')
-        total_loss_pnl = abs(sum(t['pnl'] for t in self.trade_history if t['result'] == 'Loss'))
-        # جلوگیری از خطای تقسیم بر صفر اگر هیچ معامله ضرردهی وجود نداشته باشد
-        profit_factor = total_win_pnl / total_loss_pnl if total_loss_pnl > 0 else float('inf')
-
+        print(f"Initial Balance: ${self.initial_balance:,.2f}")
+        print(f"Final Balance:   ${self.balance:,.2f}")
+        print(f"Net Profit/Loss: ${pnl:,.2f} ({pnl_percent:.2f}%)")
+        print("-" * 50)
         print(f"Total Trades:    {total_trades}")
-        print(f"Winning Trades:  {wins}")
-        print(f"Losing Trades:   {losses}")
-        print(f"Win Rate:        {win_rate:.2f}%")
+        
+        wins = [t for t in self.trade_history if t['pnl'] >= 0]
+        losses = [t for t in self.trade_history if t['pnl'] < 0]
+        
+        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+        
+        total_win_pnl = sum(t['pnl'] for t in wins)
+        total_loss_pnl = abs(sum(t['pnl'] for t in losses))
+        
+        avg_win = total_win_pnl / len(wins) if wins else 0
+        avg_loss = total_loss_pnl / len(losses) if losses else 0
+        
+        profit_factor = total_win_pnl / total_loss_pnl if total_loss_pnl > 0 else float('inf')
+        
+        print(f"Win Rate:        {win_rate:.2f}% ({len(wins)} wins / {len(losses)} losses)")
+        print(f"Average Win:     ${avg_win:,.2f}")
+        print(f"Average Loss:    ${avg_loss:,.2f}")
         print(f"Profit Factor:   {profit_factor:.2f}")
-
+        print("="*50)
