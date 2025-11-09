@@ -1,0 +1,90 @@
+--- a/strategies/ema_strategy.py
++++ b/strategies/ema_strategy.py
+@@ -6,7 +6,8 @@
+ 
+ class EmaPullbackStrategy:
+     def __init__(self, broker, risk_to_reward: float, atr_period: int,
+-                 ema_slow: int, ema_fast: int,
++                 ema_slow: int, ema_fast: int, ema_long: int,
+                  impulse_atr_multiplier: float, sl_atr_multiplier: float):
+         
+         self.broker = broker
+@@ -16,11 +17,12 @@
+         # پارامترهای اندیکاتور
+         self.atr_period = atr_period
+         self.ema_slow_period = ema_slow
+         self.ema_fast_period = ema_fast
++        self.ema_long_period = ema_long
+ 
+         self.position_open = False
+         # موتور بک‌تست باید حداقل به این تعداد کندل برای استراتژی فراهم کند
+-        self.N_BARS_FOR_ENTRY = self.ema_slow_period + 5 
++        self.N_BARS_FOR_ENTRY = self.ema_long_period + 5 # بر اساس طولانی ترین EMA
+ 
+         print("✅ EmaPullbackStrategy Initialized.")
+ 
+@@ -58,6 +60,7 @@
+         candles['ATR'] = ta.atr(candles['high'], candles['low'], candles['close'], length=self.atr_period)
+         candles['EMA_slow'] = ta.ema(candles['close'], length=self.ema_slow_period)
+         candles['EMA_fast'] = ta.ema(candles['close'], length=self.ema_fast_period)
++        candles['EMA_long'] = ta.ema(candles['close'], length=self.ema_long_period)
+         candles.dropna(inplace=True)
+--- a/strategies/ema_signal_generator.py
++++ b/strategies/ema_signal_generator.py
+@@ -10,21 +10,21 @@
+         self.impulse_confirmed = {'BUY': False, 'SELL': False}
+ 
+     def check(self, candles: pd.DataFrame):
+         """
+-        بررسی می‌کند آیا ستاپ ایمپالس و پولبک رخ داده است یا خیر.
++        ابتدا روند بلندمدت را با EMA 200 بررسی کرده و سپس ستاپ معاملاتی را جستجو می‌کند.
+         """
+         last_candle = candles.iloc[-1]
+-        
+-        # بررسی روند میان‌مدت با EMA_slow (e.g., EMA 50)
+-        is_uptrend = last_candle['close'] > last_candle['EMA_slow']
+-        is_downtrend = last_candle['close'] < last_candle['EMA_slow']
++
++        # --- فیلتر اصلی روند بلندمدت با EMA_long (e.g., EMA 200) ---
++        is_main_uptrend = last_candle['close'] > last_candle['EMA_long']
++        is_main_downtrend = last_candle['close'] < last_candle['EMA_long']
+ 
+-        if is_uptrend:
++        if is_main_uptrend:
+             # اگر در روند صعودی هستیم، فقط به دنبال ستاپ خرید بگرد
+-            return self._check_buy_setup(candles)
+-        elif is_downtrend:
++            # print(f"DEBUG: Main trend is UP. Checking for BUY setup at {last_candle.name}")
++            return self._check_buy_setup(candles) # فقط ستاپ خرید را بررسی کن
++        elif is_main_downtrend:
+             # اگر در روند نزولی هستیم، فقط به دنبال ستاپ فروش بگرد
+-            return self._check_sell_setup(candles)
++            # print(f"DEBUG: Main trend is DOWN. Checking for SELL setup at {last_candle.name}")
++            return self._check_sell_setup(candles) # فقط ستاپ فروش را بررسی کن
+ 
+         return None
+ 
+@@ -35,6 +35,11 @@
+         """بررسی شرایط برای یک ستاپ خرید."""
+         last = candles.iloc[-1]
+         prev = candles.iloc[-2]
++
++        # فیلتر ثانویه: مطمئن شویم قیمت بالای روند میان‌مدت (EMA 50) هم هست
++        if last['close'] < last['EMA_slow']:
++            self.reset() # اگر قیمت زیر روند میان‌مدت رفت، هر ایمپالس قبلی نامعتبر است
++            return None
+ 
+         # مرحله ۱: تایید حرکت ایمپالس
+         if not self.impulse_confirmed['BUY']:
+@@ -60,6 +65,11 @@
+         last = candles.iloc[-1]
+         prev = candles.iloc[-2]
+ 
++        # فیلتر ثانویه: مطمئن شویم قیمت پایین روند میان‌مدت (EMA 50) هم هست
++        if last['close'] > last['EMA_slow']:
++            self.reset() # اگر قیمت بالای روند میان‌مدت رفت، هر ایمپالس قبلی نامعتبر است
++            return None
++
+         # مرحله ۱: تایید حرکت ایمپالس
+         if not self.impulse_confirmed['SELL']:
+             impulse_distance = self.impulse_atr_multiplier * last['ATR']
