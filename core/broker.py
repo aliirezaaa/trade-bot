@@ -1,86 +1,105 @@
-# File: core/broker.py (نسخه نهایی)
+# core/broker.py
 
-class BacktestBroker:
-    """
-    یک بروکر را برای اهداف بک‌تست شبیه‌سازی می‌کند.
-    """
-    def __init__(self, initial_balance: float, risk_manager):
+class Broker:
+    def __init__(self, initial_balance: float, risk_manager, pip_size: float):
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.risk_manager = risk_manager
-        
+        self.pip_size = pip_size
         self.open_positions = []
         self.trade_history = []
-        
-        # این متغیر برای نگهداری متد callback استراتژی است
         self.on_position_closed_callback = None
-        
-        print(f"✅ Broker Initialized. Initial Balance: ${self.initial_balance:,.2f}")
 
-    def set_strategy_callbacks(self, position_closed):
-        """
-        متدهای بازگشتی (callbacks) را از استراتژی دریافت و ذخیره می‌کند.
-        این متد باید از runner.py فراخوانی شود.
-        """
-        self.on_position_closed_callback = position_closed
-        print("🔗 Broker is now linked with strategy callbacks.")
+    def register_on_close_callback(self, callback_func):
+        self.on_position_closed_callback = callback_func
 
-    def place_market_order(self, direction: str, sl: float, tp: float, current_bar):
-        # ... (بقیه کد این متد بدون تغییر باقی می‌ماند)
-        entry_price = current_bar['close']
-        
-        lot_size = self.risk_manager.calculate_lot_size(entry_price, sl)
-        
-        if lot_size < 0.01:
-            print("❌ ORDER FAILED (Broker): Lot size is too small after calculation. Skipping trade.")
+    def place_market_order(self, order_type: str, sl_price: float, tp_price: float):
+        if self.open_positions:
+            return
+
+        entry_price = self.current_bar['close']
+        lot_size = self.risk_manager.calculate_lot_size(entry_price, sl_price)
+
+        if lot_size < self.risk_manager.min_lot:
+            print(f"  ⚠️ Calculated lot size ({lot_size}) is below minimum. Skipping trade.")
             return
 
         position = {
-            'direction': direction,
-            'lot_size': lot_size,
-            'entry_price': entry_price,
-            'sl': sl,
-            'tp': tp,
-            'entry_time': current_bar.name,
-            'pnl': 0.0,
-            'close_price': None,
-            'close_time': None
+            'type': order_type, 'volume': lot_size,
+            'entry_price': entry_price, 'sl_price': sl_price, 'tp_price': tp_price,
+            'entry_time': self.current_bar.name, 'pnl': 0.0,
+            'close_price': None, 'close_time': None
         }
         self.open_positions.append(position)
-        print(f"  -> 🔵 ORDER PLACED: {direction} {lot_size} lots @ {entry_price:.5f} | SL={sl:.5f} TP={tp:.5f}")
-
+        risk_usd = self.risk_manager.risk_per_trade_usd
+        print(f"\n🔵 [{self.current_bar.name}] New Position: {order_type} {lot_size} lot @ {entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}. Risking ~${risk_usd:.2f}")
 
     def check_open_trades(self, current_bar):
-        # ... (منطق بررسی SL/TP بدون تغییر باقی می‌ماند)
+        self.current_bar = current_bar
+        if not self.open_positions:
+            return
+
         positions_to_close = []
         for pos in self.open_positions:
-            # ... (کد بررسی SL/TP)
             closed_by = None
             close_price = None
 
-            if pos['direction'] == 'BUY':
-                if current_bar['low'] <= pos['sl']: closed_by, close_price = 'SL', pos['sl']
-                elif current_bar['high'] >= pos['tp']: closed_by, close_price = 'TP', pos['tp']
-            elif pos['direction'] == 'SELL':
-                if current_bar['high'] >= pos['sl']: closed_by, close_price = 'SL', pos['sl']
-                elif current_bar['low'] <= pos['tp']: closed_by, close_price = 'TP', pos['tp']
+            if pos['type'] == 'BUY':
+                if current_bar['low'] <= pos['sl_price']:
+                    closed_by, close_price = 'SL', pos['sl_price']
+                elif current_bar['high'] >= pos['tp_price']:
+                    closed_by, close_price = 'TP', pos['tp_price']
+            elif pos['type'] == 'SELL':
+                if current_bar['high'] >= pos['sl_price']:
+                    closed_by, close_price = 'SL', pos['sl_price']
+                elif current_bar['low'] <= pos['tp_price']:
+                    closed_by, close_price = 'TP', pos['tp_price']
 
             if closed_by:
-                # ... (کد محاسبه PnL)
-                pnl_pips = (close_price - pos['entry_price']) if pos['direction'] == 'BUY' else (pos['entry_price'] - close_price)
-                pnl_pips /= self.risk_manager.pip_size
-                pnl_usd = pnl_pips * pos['lot_size'] * self.risk_manager.pip_value_per_lot
-                self.balance += pnl_usd
-                
-                pos.update({'pnl': pnl_usd, 'close_price': close_price, 'close_time': current_bar.name})
+                pnl = self._calculate_pnl(pos, close_price)
+                self.balance += pnl
+                pos.update({
+                    'pnl': pnl, 'close_price': close_price,
+                    'close_time': current_bar.name
+                })
                 self.trade_history.append(pos)
                 positions_to_close.append(pos)
+
+                result_icon = '🔴' if pnl < 0 else '🟢'
+                print(f"{result_icon} [{current_bar.name}] Position Closed by {closed_by}: PnL: ${pnl:.2f}. Balance: ${self.balance:.2f}")
                 
-                status = "WIN" if pnl_usd >= 0 else "LOSS"
-                print(f"  -> 🔴 POSITION CLOSED by {closed_by} ({status}): PnL=${pnl_usd:,.2f}, Balance=${self.balance:,.2f}")
-
-                # <<< تغییر اصلی: فراخوانی callback ذخیره شده >>>
                 if self.on_position_closed_callback:
-                    self.on_position_closed_callback()
+                    self.on_position_closed_callback(pos)
 
-        self.open_positions = [p for p in self.open_positions if p not in positions_to_close]
+        if positions_to_close:
+            self.open_positions = [p for p in self.open_positions if p not in positions_to_close]
+            
+    def close_all_open_positions(self, final_bar):
+        closed_trades = []
+        if not self.open_positions:
+            return closed_trades
+        
+        print(f"\n--- Closing all open positions at the end of backtest at {final_bar.name} ---")
+        for pos in self.open_positions:
+            close_price = final_bar['close']
+            pnl = self._calculate_pnl(pos, close_price)
+            self.balance += pnl
+            pos.update({
+                'pnl': pnl, 'close_price': close_price,
+                'close_time': final_bar.name
+            })
+            closed_trades.append(pos)
+            print(f"⚪️ Position Closed (End of Data): PnL: ${pnl:.2f}. Balance: ${self.balance:.2f}")
+        
+        self.open_positions = []
+        return closed_trades
+            
+    def _calculate_pnl(self, position, close_price):
+        pnl_pips = 0
+        if position['type'] == 'BUY':
+            pnl_pips = (close_price - position['entry_price']) / self.pip_size
+        else: # SELL
+            pnl_pips = (position['entry_price'] - close_price) / self.pip_size
+        
+        pnl_usd = pnl_pips * self.risk_manager.pip_value_per_lot * position['volume']
+        return pnl_usd
