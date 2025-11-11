@@ -70,7 +70,8 @@ class LiveEMAPullbackBot:
         self.state = BotState.SEARCHING
         self.df = pd.DataFrame()
         self.last_processed_time = None
-        self.impulse_candle_time = None
+        self.impulse_direction = None  # "BUY" or "SELL" or None
+        
 
         # MT5 symbol info
         self.point = 0
@@ -149,7 +150,7 @@ class LiveEMAPullbackBot:
             if rates is None or len(rates) < 2:
                 return False
 
-            # ⭐ FIX: تبدیل کل آرایه به DataFrame یکجا
+            # تبدیل کل آرایه به DataFrame یکجا
             temp_df = pd.DataFrame(rates)
             temp_df['time'] = pd.to_datetime(temp_df['time'], unit='s')
             temp_df.set_index('time', inplace=True)
@@ -161,9 +162,9 @@ class LiveEMAPullbackBot:
             previous_time = temp_df.index[-2]
             previous_candle = temp_df.iloc[-2]
 
-            # اگر کندل جدید شروع شده
-            if current_time > self.last_processed_time:
-             # ⭐ کندل بسته شده (قبلی) رو به عنوان DataFrame اضافه کن
+            # ⭐ FIX: چک کن که کندل بسته شده جدیده یا نه
+            if previous_time > self.last_processed_time:
+                # کندل بسته شده (قبلی) رو به عنوان DataFrame اضافه کن
                 new_row = temp_df.iloc[-2:-1]  # این یک DataFrame تک‌رکوردی می‌سازه
 
                 self.df = pd.concat([self.df, new_row])
@@ -174,7 +175,8 @@ class LiveEMAPullbackBot:
                 if len(self.df) == 0:
                     return False
 
-                self.last_processed_time = current_time
+                # ⭐ FIX: ذخیره زمان کندل بسته شده (نه کندل در حال شکل‌گیری!)
+                self.last_processed_time = previous_time
 
                 # لاگ کندل بسته شده با مقادیر باندها
                 last_closed = self.df.iloc[-1]
@@ -182,12 +184,12 @@ class LiveEMAPullbackBot:
                 h = float(previous_candle['high'])
                 l = float(previous_candle['low'])
                 c = float(previous_candle['close'])
-            
+
                 if 'KC_upper' in last_closed and not pd.isna(last_closed['KC_upper']):
                     upper = float(last_closed['KC_upper'])
                     middle = float(last_closed['KC_middle'])
                     lower = float(last_closed['KC_lower'])
-                
+
                     self.log(f"🆕 New candle: {previous_time.strftime('%H:%M:%S')} | O:{o:.2f} H:{h:.2f} L:{l:.2f} C:{c:.2f}")
                     self.log(f"   📊 Bands: Upper={upper:.2f}, Middle={middle:.2f}, Lower={lower:.2f}")
                 else:
@@ -203,6 +205,46 @@ class LiveEMAPullbackBot:
 
         return False
 
+    def check_mt5_connection(self) -> bool:
+        """Check and restore MT5 connection if needed"""
+        terminal_info = mt5.terminal_info()
+
+        if terminal_info is None:
+            self.log("⚠️  MT5 connection lost. Reconnecting...")
+            mt5.shutdown()
+            if mt5.initialize():
+                self.log("✅ MT5 reconnected")
+                return True
+            else:
+                self.log("❌ Failed to reconnect MT5")
+                return False
+
+        if not terminal_info.connected:
+            self.log("⚠️  MT5 not connected to broker")
+            return False
+
+        return True
+
+    def is_market_open(self) -> bool:
+        """Check if market is open"""
+        symbol_info = mt5.symbol_info(self.config.SYMBOL)
+
+        if symbol_info is None:
+            self.log(f"⚠️  Symbol {self.config.SYMBOL} not found")
+            return False
+
+        # Check trading status
+        if symbol_info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+            self.log(f"⚠️  Market closed for {self.config.SYMBOL}")
+            return False
+
+        # Check spread (if too high, market might be closed)
+        spread = symbol_info.spread
+        if spread > 100:  # برای XAUUSD معمولاً spread کمتر از 50 هست
+            self.log(f"⚠️  Abnormal spread: {spread} (Market might be closed)")
+            return False
+
+        return True
 
     def calculate_indicators(self):
         self.df['KC_middle'] = ta.ema(self.df['close'], length=self.config.KC_EMA_PERIOD)
@@ -319,14 +361,14 @@ class LiveEMAPullbackBot:
         # BUY: High touched upper band
         if forming['high'] >= forming['KC_upper']:
             if self.check_filters("BUY", forming):
-                self.impulse_candle_time = forming.name
+               
                 self.log(f"🚀 IMPULSE (BUY): High={forming['high']:.2f} >= Upper={forming['KC_upper']:.2f}")
                 return "BUY"
 
         # SELL: Low touched lower band
         if forming['low'] <= forming['KC_lower']:
             if self.check_filters("SELL", forming):
-                self.impulse_candle_time = forming.name
+                
                 self.log(f"🚀 IMPULSE (SELL): Low={forming['low']:.2f} <= Lower={forming['KC_lower']:.2f}")
                 return "SELL"
 
@@ -339,10 +381,7 @@ class LiveEMAPullbackBot:
         if forming is None:
             return False
 
-        # ⭐ CRITICAL: Prevent same-candle impulse+pullback detection
-        if self.impulse_candle_time is not None:
-            if forming.name == self.impulse_candle_time:
-                return False
+      
 
         middle = forming['KC_middle']
 
@@ -355,6 +394,33 @@ class LiveEMAPullbackBot:
             if forming['high'] >= middle:
                 self.log(f"👀 Pullback Touch (SELL): High={forming['high']:.2f} >= Middle={middle:.2f}")
                 return True
+
+        return False
+    
+    def check_entry_confirmed_closed(self, direction: str) -> bool:
+        """
+        Check if CLOSED candle confirms entry
+        Returns: True if entry confirmed
+        """
+        if len(self.df) == 0:
+            return False
+
+        last = self.df.iloc[-1]
+        middle = last['KC_middle']
+
+        if direction == "BUY":
+            if last['close'] > middle:
+                self.log(f"   ✅ Entry Confirmed (BUY): Close={last['close']:.2f} > Middle={middle:.2f}")
+                return True
+            else:
+                self.log(f"   ❌ Entry NOT Confirmed (BUY): Close={last['close']:.2f} <= Middle={middle:.2f}")
+
+        elif direction == "SELL":
+            if last['close'] < middle:
+                self.log(f"   ✅ Entry Confirmed (SELL): Close={last['close']:.2f} < Middle={middle:.2f}")
+                return True
+            else:
+                self.log(f"   ❌ Entry NOT Confirmed (SELL): Close={last['close']:.2f} >= Middle={middle:.2f}")
 
         return False
 
@@ -453,123 +519,187 @@ class LiveEMAPullbackBot:
 
         return True
 
-    def check_position_status(self):
-        """Check if position is still open"""
-        positions = mt5.positions_get(symbol=self.config.SYMBOL, magic=self.config.MAGIC_NUMBER)
+    def check_position_status(self) -> bool:
+        """Check if position is still open (using MAGIC_NUMBER)"""
+        positions = mt5.positions_get(
+            symbol=self.config.SYMBOL, 
+            magic=self.config.MAGIC_NUMBER
+        )
 
         if positions is None or len(positions) == 0:
-            self.log("🔄 Position closed. → SEARCHING")
-            self.state = BotState.SEARCHING
-            self.impulse_candle_time = None
+            return False  # No position open
+
+        return True  # Position still open
+
+            
+    def check_pullback_and_entry_closed(self, direction: str) -> bool:
+        """
+        Check if CLOSED candle:
+        1. Touched middle line
+        2. Closed in trade direction
+
+        Returns: True if both conditions met
+        """
+        if len(self.df) == 0:
+            return False
+
+        last = self.df.iloc[-1]
+        middle = last['KC_middle']
+
+        if direction == "BUY":
+            # Must touch middle AND close ABOVE it
+            touched_middle = last['low'] <= middle
+            closed_correctly = last['close'] > middle
+
+            if touched_middle and closed_correctly:
+                self.log(f"   ✅ Pullback+Entry (BUY): Low={last['low']:.2f} <= Middle={middle:.2f}, Close={last['close']:.2f} > Middle")
+                return True
+            else:
+                if not touched_middle:
+                    self.log(f"   ⏳ Middle not touched yet (BUY): Low={last['low']:.2f} > Middle={middle:.2f}")
+                elif not closed_correctly:
+                    self.log(f"   ⏳ Not closed above middle (BUY): Close={last['close']:.2f} <= Middle={middle:.2f}")
+
+        elif direction == "SELL":
+            # Must touch middle AND close BELOW it
+            touched_middle = last['high'] >= middle
+            closed_correctly = last['close'] < middle
+
+            if touched_middle and closed_correctly:
+                self.log(f"   ✅ Pullback+Entry (SELL): High={last['high']:.2f} >= Middle={middle:.2f}, Close={last['close']:.2f} < Middle")
+                return True
+            else:
+                if not touched_middle:
+                    self.log(f"   ⏳ Middle not touched yet (SELL): High={last['high']:.2f} < Middle={middle:.2f}")
+                elif not closed_correctly:
+                    self.log(f"   ⏳ Not closed below middle (SELL): Close={last['close']:.2f} >= Middle={middle:.2f}")
+
+        return False
 
     # ------------------------------------------------------------------------
     # STATE MACHINE
     # ------------------------------------------------------------------------
 
     def process_strategy(self, new_candle: bool):
-        """Main strategy state machine"""
+         """Main strategy orchestrator - delegates to state handlers"""
 
-        # ⭐ State: POSITION_OPEN - Check FIRST
-        if self.state == BotState.POSITION_OPEN:
-            self.check_position_status()
-            # If position closed, state is now SEARCHING
-            # Continue to SEARCHING block below instead of returning
-            if self.state != BotState.SEARCHING:
-                return  # Position still open, exit iteration
+         # Check position status if open
+         if self.state == BotState.POSITION_OPEN:
+             self.check_position_status()
+             # If closed, state changed to SEARCHING - continue execution
+         # Delegate to appropriate state handler
+         if self.state == BotState.SEARCHING:
+             self._handle_searching()
+         elif self.state == BotState.IMPULSE_DETECTED_BUY:
+             self._handle_impulse_buy()
+         elif self.state == BotState.IMPULSE_DETECTED_SELL:
+             self._handle_impulse_sell()
+         elif self.state == BotState.PULLBACK_TOUCHED_BUY:
+             self._handle_pullback_buy(new_candle)
+         elif self.state == BotState.PULLBACK_TOUCHED_SELL:
+             self._handle_pullback_sell(new_candle)
 
-        # ⭐ State: SEARCHING (executes immediately after position close!)
-        if self.state == BotState.SEARCHING:
-            self.log("🔍 SEARCHING: Checking for impulse...")
-        
-            impulse = self.detect_impulse_forming()
 
-            if impulse == "BUY":
-                self.state = BotState.IMPULSE_DETECTED_BUY
-                self.log(f"🔄 State: SEARCHING → IMPULSE_DETECTED_BUY")
+        # ============================================================
+        # STATE HANDLERS (Clean & Modular)
+        # ============================================================
 
-            elif impulse == "SELL":
-                self.state = BotState.IMPULSE_DETECTED_SELL
-                self.log(f"🔄 State: SEARCHING → IMPULSE_DETECTED_SELL")
+    def _handle_searching(self):
+        """Handle SEARCHING state - detect impulse"""
+        self.log("🔍 SEARCHING: Checking for impulse...")
 
-        # State: IMPULSE_DETECTED_BUY
-        elif self.state == BotState.IMPULSE_DETECTED_BUY:
-            forming = self.get_forming_candle()
+        impulse = self.detect_impulse_forming()
 
-            if forming is None:
-                return
+        if impulse == "BUY":
+            self._transition_to(BotState.IMPULSE_DETECTED_BUY, "SEARCHING → IMPULSE_DETECTED_BUY")
 
-            # Check for opposite impulse (reset)
-            if forming['low'] <= forming['KC_lower']:
-                self.log(f"🔄 Reset: Low touched lower band. → SEARCHING")
-                self.state = BotState.SEARCHING
-                self.impulse_candle_time = None
-                return
+        elif impulse == "SELL":
+            self._transition_to(BotState.IMPULSE_DETECTED_SELL, "SEARCHING → IMPULSE_DETECTED_SELL")
 
-        #    Check pullback touch
-            if self.check_pullback_touch_forming("BUY"):
-                self.state = BotState.PULLBACK_TOUCHED_BUY
-                self.log(f"🔄 State: IMPULSE_DETECTED_BUY → PULLBACK_TOUCHED_BUY")
 
-        # State: IMPULSE_DETECTED_SELL
-        elif self.state == BotState.IMPULSE_DETECTED_SELL:
-            forming = self.get_forming_candle()
+    def _handle_impulse_buy(self):
+        """Handle IMPULSE_DETECTED_BUY state"""
+        forming = self.get_forming_candle()
 
-            if forming is None:
-                    return
+        if forming is None:
+            return
 
-            # Check for opposite impulse (reset)
-            if forming['high'] >= forming['KC_upper']:
-                self.log(f"🔄 Reset: High touched upper band. → SEARCHING")
-                self.state = BotState.SEARCHING
-                self.impulse_candle_time = None
-                return
+        # Check for opposite impulse (reset)
+        if forming['low'] <= forming['KC_lower']:
+            self.log("🔄 Reset: Low touched lower band.")
+            self._transition_to(BotState.SEARCHING, "IMPULSE_DETECTED_BUY → SEARCHING (Reset)")
+            return
 
-            # Check pullback touch
-            if self.check_pullback_touch_forming("SELL"):
-                self.state = BotState.PULLBACK_TOUCHED_SELL
-                self.log(f"🔄 State: IMPULSE_DETECTED_SELL → PULLBACK_TOUCHED_SELL")
+        # Check pullback touch
+        if self.check_pullback_touch_forming("BUY"):
+            self._transition_to(BotState.PULLBACK_TOUCHED_BUY, "IMPULSE_DETECTED_BUY → PULLBACK_TOUCHED_BUY")
 
-        # State: PULLBACK_TOUCHED_BUY
-        elif self.state == BotState.PULLBACK_TOUCHED_BUY:
-            # ⭐ Wait for new CLOSED candle
-            if not new_candle:
-                return
 
-            # Check if closed candle confirms entry
-            if self.check_pullback_entry_closed("BUY"):
-                if self.open_position("BUY"):
-                    self.state = BotState.POSITION_OPEN
-                    self.log(f"🔄 State: PULLBACK_TOUCHED_BUY → POSITION_OPEN")
-                    self.impulse_candle_time = None
-                else:
-                    self.log("❌ Failed to open position. → SEARCHING")
-                    self.state = BotState.SEARCHING
-                    self.impulse_candle_time = None
+    def _handle_impulse_sell(self):
+        """Handle IMPULSE_DETECTED_SELL state"""
+        forming = self.get_forming_candle()
+
+        if forming is None:
+            return
+
+        # Check for opposite impulse (reset)
+        if forming['high'] >= forming['KC_upper']:
+            self.log("🔄 Reset: High touched upper band.")
+            self._transition_to(BotState.SEARCHING, "IMPULSE_DETECTED_SELL → SEARCHING (Reset)")
+            return
+
+        # Check pullback touch
+        if self.check_pullback_touch_forming("SELL"):
+            self._transition_to(BotState.PULLBACK_TOUCHED_SELL, "IMPULSE_DETECTED_SELL → PULLBACK_TOUCHED_SELL")
+
+
+    def _handle_pullback_buy(self, new_candle: bool):
+        """Handle PULLBACK_TOUCHED_BUY state"""
+        # Wait for closed candle
+        if not new_candle:
+            return
+
+        # Check entry confirmation
+        if self.check_pullback_entry_closed("BUY"):
+            if self.open_position("BUY"):
+                self._transition_to(BotState.POSITION_OPEN, "PULLBACK_TOUCHED_BUY → POSITION_OPEN")
             else:
-                self.log("⏳ Closed candle did not confirm entry. → SEARCHING")
-                self.state = BotState.SEARCHING
-                self.impulse_candle_time = None
+                self.log("❌ Failed to open position.")
+                self._transition_to(BotState.SEARCHING, "PULLBACK_TOUCHED_BUY → SEARCHING (Order Failed)")
+        else:
+            self.log("⏳ Closed candle did not confirm entry.")
+            self._transition_to(BotState.SEARCHING, "PULLBACK_TOUCHED_BUY → SEARCHING (No Confirmation)")
 
-        # State: PULLBACK_TOUCHED_SELL
-        elif self.state == BotState.PULLBACK_TOUCHED_SELL:
-            # ⭐ Wait for new CLOSED candle
-            if not new_candle:
-                return
 
-            # Check if closed candle confirms entry
-            if self.check_pullback_entry_closed("SELL"):
-                if self.open_position("SELL"):
-                    self.state = BotState.POSITION_OPEN
-                    self.log(f"🔄 State: PULLBACK_TOUCHED_SELL → POSITION_OPEN")
-                    self.impulse_candle_time = None
-                else:
-                    self.log("❌ Failed to open position. → SEARCHING")
-                    self.state = BotState.SEARCHING
-                    self.impulse_candle_time = None
+    def _handle_pullback_sell(self, new_candle: bool):
+        """Handle PULLBACK_TOUCHED_SELL state"""
+        # Wait for closed candle
+        if not new_candle:
+            return
+
+        # Check entry confirmation
+        if self.check_pullback_entry_closed("SELL"):
+            if self.open_position("SELL"):
+                self._transition_to(BotState.POSITION_OPEN, "PULLBACK_TOUCHED_SELL → POSITION_OPEN")
             else:
-                self.log("⏳ Closed candle did not confirm entry. → SEARCHING")
-                self.state = BotState.SEARCHING
-                self.impulse_candle_time = None
+                self.log("❌ Failed to open position.")
+                self._transition_to(BotState.SEARCHING, "PULLBACK_TOUCHED_SELL → SEARCHING (Order Failed)")
+        else:
+            self.log("⏳ Closed candle did not confirm entry.")
+            self._transition_to(BotState.SEARCHING, "PULLBACK_TOUCHED_SELL → SEARCHING (No Confirmation)")
+
+
+    # ============================================================
+    # HELPER: Clean State Transition
+    # ============================================================
+
+    def _transition_to(self, new_state: BotState, log_message: str):
+        """Centralized state transition with logging"""
+        self.state = new_state
+        self.log(f"🔄 State: {log_message}")
+
+
+    
 
 
     # ------------------------------------------------------------------------
@@ -584,6 +714,15 @@ class LiveEMAPullbackBot:
 
         while True:
             try:
+                if not self.check_mt5_connection():
+                    self.log("⏸️  Waiting for MT5 connection...")
+                    time.sleep(10)
+                    continue
+        
+                if not self.is_market_open():
+                    time.sleep(60)
+                    continue
+                
                 new_candle = self.update_data()
                 self.process_strategy(new_candle)
                 time.sleep(1)
