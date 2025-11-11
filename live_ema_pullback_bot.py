@@ -469,8 +469,18 @@ class LiveEMAPullbackBot:
     def process_strategy(self, new_candle: bool):
         """Main strategy state machine"""
 
-        # State: SEARCHING
+        # ⭐ State: POSITION_OPEN - Check FIRST
+        if self.state == BotState.POSITION_OPEN:
+            self.check_position_status()
+            # If position closed, state is now SEARCHING
+            # Continue to SEARCHING block below instead of returning
+            if self.state != BotState.SEARCHING:
+                return  # Position still open, exit iteration
+
+        # ⭐ State: SEARCHING (executes immediately after position close!)
         if self.state == BotState.SEARCHING:
+            self.log("🔍 SEARCHING: Checking for impulse...")
+        
             impulse = self.detect_impulse_forming()
 
             if impulse == "BUY":
@@ -495,7 +505,7 @@ class LiveEMAPullbackBot:
                 self.impulse_candle_time = None
                 return
 
-            # Check pullback touch
+        #    Check pullback touch
             if self.check_pullback_touch_forming("BUY"):
                 self.state = BotState.PULLBACK_TOUCHED_BUY
                 self.log(f"🔄 State: IMPULSE_DETECTED_BUY → PULLBACK_TOUCHED_BUY")
@@ -505,7 +515,7 @@ class LiveEMAPullbackBot:
             forming = self.get_forming_candle()
 
             if forming is None:
-                return
+                    return
 
             # Check for opposite impulse (reset)
             if forming['high'] >= forming['KC_upper']:
@@ -561,9 +571,6 @@ class LiveEMAPullbackBot:
                 self.state = BotState.SEARCHING
                 self.impulse_candle_time = None
 
-        # State: POSITION_OPEN
-        elif self.state == BotState.POSITION_OPEN:
-            self.check_position_status()
 
     # ------------------------------------------------------------------------
     # MAIN LOOP
