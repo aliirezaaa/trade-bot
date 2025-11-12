@@ -64,7 +64,7 @@ class BotState(Enum):
 # MAIN BOT
 # ============================================================================
 
-class LiveEMAPullbackBot:
+class LiveKeltnerkBot:
     def __init__(self, config: BotConfig):
         self.config = config
         self.state = BotState.SEARCHING
